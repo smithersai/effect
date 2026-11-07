@@ -416,6 +416,8 @@ EFFECT_FUZZ="parse never dies" EFFECT_FUZZ_DURATION="60 seconds" EFFECT_FUZZ_SEE
 ```
 
 `EFFECT_FUZZ=1` selects every fuzz test; `EFFECT_FUZZ_EXECUTIONS` bounds a session by executions. Returning `false`,
-failing, or dying is a finding. With `fuzz: { execution: FuzzSimulation.execution() }`, plain runs replay under the simulation too, and
+failing, or dying is a finding. The property must give the same outcome for the same input and must not mutate it: copy
+an input before passing it to an API that mutates it. A failure whose input passes when evaluated again fails the test
+as `FLAKY`. With `fuzz: { execution: FuzzSimulation.execution() }`, plain runs replay under the simulation too, and
 `it.effect.fuzz` lets the simulation own `Clock` and `Scheduler` instead of `TestClock`. See `FUZZ.md` in the `effect`
 package for feedback, corpus and schedule fuzzing.

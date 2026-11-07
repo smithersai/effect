@@ -1,4 +1,5 @@
 import type * as Arbitrary from "../../Arbitrary.ts"
+import * as Arr from "../../Array.ts"
 import * as Cause from "../../Cause.ts"
 import * as Context from "../../Context.ts"
 import * as Data from "../../Data.ts"
@@ -207,7 +208,7 @@ export const generate = <A>(
 // evaluation
 // -----------------------------------------------------------------------------
 
-type Outcome<E> = { readonly _tag: "Passed" } | { readonly _tag: "Limited" } | Fuzz.Failure<E>
+type Outcome<E> = Fuzz.Outcome<E>
 
 const passed = { _tag: "Passed" } as const
 const limited = { _tag: "Limited" } as const
@@ -432,6 +433,22 @@ const storeCall = <A>(what: string, call: () => Effect.Effect<A, FuzzError>): Ef
     )
   )
 
+/**
+ * Evaluates the final input of a finding once more. A finding is reported as is only when the second evaluation fails
+ * with the same signature; otherwise it is flaky and keeps both outcomes.
+ */
+const confirm = <A, E, R>(
+  property: (value: A) => boolean | Effect.Effect<boolean, E, R>,
+  value: A,
+  input: Format.Input,
+  options: Resolved,
+  signature: string
+): Effect.Effect<Outcome<E> | undefined, FuzzError, R> =>
+  Effect.map(
+    evaluate(property, value, input, options, []),
+    (measured) => signatureOf(measured.outcome) === signature ? undefined : measured.outcome
+  )
+
 // -----------------------------------------------------------------------------
 // the run
 // -----------------------------------------------------------------------------
@@ -464,7 +481,9 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
   const rng = Tape.makeRng(seed)
   const maxOpsBeforeYield = yield* Scheduler.MaxOpsBeforeYield
 
-  const findings = new Map<string, Fuzz.Finding<A, E>>()
+  // Keyed by signature. A flaky finding carries the outcome of its confirming evaluation.
+  const findings = new Map<string, Fuzz.Finding<A, E> & { readonly recheck?: Outcome<E> | undefined }>()
+  let confirmed = 0
   const features: Record<string, number> = {}
   // Executions that produced each (feature, bucket) pair. An entry's energy is the rarity of the rarest pair it owns,
   // following AFL++'s "fast" power schedule, so the search keeps working on the frontier.
@@ -558,9 +577,12 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
     initialInput: A,
     shrinks: number,
     execution: number,
-    replay: string | undefined
+    replay: string | undefined,
+    recheck: Outcome<E> | undefined
   ) => {
-    findings.set(signature, { signature, failure, input, initialInput, shrinks, execution, replay, saved })
+    const found: Fuzz.Finding<A, E> = { signature, failure, input, initialInput, shrinks, execution, replay, saved }
+    findings.set(signature, recheck === undefined ? found : { ...found, recheck })
+    if (recheck === undefined) confirmed++
     sinceProgress = 0
   }
 
@@ -583,7 +605,8 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       regenerated.attempt.value,
       shrunk.shrinks,
       executions,
-      replayToken(final, shrunk.path, signature)
+      replayToken(final, shrunk.path, signature),
+      yield* confirm(property, shrunk.sample.value, final, resolved, signature)
     )
   })
 
@@ -637,7 +660,8 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       value,
       0,
       0,
-      entry.revision === target.revision ? replayToken(entry.input, entry.path, signature) : undefined
+      entry.revision === target.revision ? replayToken(entry.input, entry.path, signature) : undefined,
+      yield* confirm(property, value, entry.input, resolved, signature)
     )
   }
 
@@ -757,7 +781,8 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
 
   let stoppedBy: Fuzz.Stats["stoppedBy"]
   while (true) {
-    if (findings.size >= resolved.maxFindings) {
+    // Only confirmed findings stop the search; a flaky one is kept, and the search goes on.
+    if (confirmed >= resolved.maxFindings) {
       stoppedBy = "Findings"
       break
     }
@@ -808,11 +833,23 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
     stale,
     stoppedBy
   }
-  const all = Array.from(findings.values())
-  return all.length === 0
-    ? { _tag: "Passed", stats }
-    : { _tag: "Falsified", findings: all as [Fuzz.Finding<A, E>, ...Array<Fuzz.Finding<A, E>>], stats }
+  return report(Array.from(findings.values()), stats)
 })
+
+const report = <A, E>(
+  all: ReadonlyArray<Fuzz.Finding<A, E> & { readonly recheck?: Outcome<E> | undefined }>,
+  stats: Fuzz.Stats
+): Fuzz.Report<A, E> => {
+  const findings: Array<Fuzz.Finding<A, E>> = []
+  const flaky: Array<Fuzz.FlakyFinding<A, E>> = []
+  for (const found of all) {
+    if (found.recheck === undefined) findings.push(found)
+    else flaky.push(found as Fuzz.FlakyFinding<A, E>)
+  }
+  if (Arr.isArrayNonEmpty(findings)) return { _tag: "Falsified", findings, flaky, stats }
+  if (Arr.isArrayNonEmpty(flaky)) return { _tag: "Flaky", flaky, stats }
+  return { _tag: "Passed", stats }
+}
 
 const replay = Effect.fnUntraced(function*<A, E, R>(
   target: TargetImpl<A, E, R>,
@@ -849,7 +886,8 @@ const replay = Effect.fnUntraced(function*<A, E, R>(
     replay: token,
     saved: "None"
   }
-  return { _tag: "Falsified", findings: [finding], stats }
+  const recheck = yield* confirm(target.property, sample.value, data.input, options, data.signature)
+  return report([recheck === undefined ? finding : { ...finding, recheck }], stats)
 })
 
 // -----------------------------------------------------------------------------

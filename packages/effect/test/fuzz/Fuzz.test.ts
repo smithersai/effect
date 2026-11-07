@@ -672,4 +672,95 @@ describe("Fuzz", () => {
         assert.deepStrictEqual([finding.signature, finding.saved], ["ReturnedFalse", "None"])
       }))
   })
+
+  describe("confirmation", () => {
+    it.effect("a finding's final input is evaluated once more before it is reported", () =>
+      Effect.gen(function*() {
+        let calls = 0
+        const report = yield* Fuzz.run(Arbitrary.Constant(0), () => {
+          calls++
+          return false
+        }, { seed: 1, executions: 1 })
+        assert.deepStrictEqual([report._tag, calls], ["Falsified", 2])
+        assert.deepStrictEqual(report._tag === "Falsified" && report.flaky, [])
+      }))
+
+    it.effect("a failure that passes on the second evaluation is flaky, never Falsified", () =>
+      Effect.gen(function*() {
+        let calls = 0
+        const report = yield* Fuzz.run(Arbitrary.Constant(0), () => calls++ !== 0, { seed: 1, executions: 10 })
+        assert.strictEqual(report._tag, "Flaky")
+        if (report._tag !== "Flaky") return
+        const [flaky] = report.flaky
+        assert.deepStrictEqual([flaky.signature, flaky.failure, flaky.recheck], [
+          "ReturnedFalse",
+          { _tag: "ReturnedFalse" },
+          { _tag: "Passed" }
+        ])
+        // The search went on: a flaky finding does not count toward maxFindings.
+        assert.deepStrictEqual([report.stats.executions, report.stats.stoppedBy], [10, "Executions"])
+        const text = Fuzz.formatReport(report)!
+        assert.include(text, "0 failure(s) and 1 flaky failure(s)")
+        assert.include(text, "FLAKY ReturnedFalse after 0 shrink(s): the same input then gave Passed")
+        assert.include(text, "Then: passed")
+      }))
+
+    it.effect("a failure that changes signature keeps both outcomes, beside confirmed findings", () =>
+      Effect.gen(function*() {
+        let calls = 0
+        const report = yield* Fuzz.run(
+          Arbitrary.Constant(0),
+          () => calls++ === 0 ? false : Effect.die(new RangeError("later")),
+          { seed: 1, executions: 10 }
+        )
+        assert.strictEqual(report._tag, "Falsified")
+        if (report._tag !== "Falsified") return
+        assert.deepStrictEqual(report.findings.map((finding) => finding.signature), ["Died:RangeError"])
+        assert.deepStrictEqual(report.flaky.map((finding) => [finding.signature, finding.recheck._tag]), [[
+          "ReturnedFalse",
+          "Died"
+        ]])
+        assert.include(Fuzz.formatReport(report)!, "1 failure(s) and 1 flaky failure(s)")
+        assert.include(Fuzz.formatReport(report)!, "then gave Died:RangeError")
+      }))
+
+    it.effect("saved failures and replay tokens are confirmed too", () =>
+      Effect.gen(function*() {
+        const store = Fuzz.memoryCorpus()
+        const deterministic = Fuzz.target(Int, (n) => n < 500, { id: "flaky-saved", revision: "1" })
+        const found = firstFinding(
+          yield* Fuzz.runTarget(deterministic, { seed: 1, executions: 2_000 }).pipe(withStore(store))
+        )
+        // Every second evaluation passes, whatever the input.
+        let calls = 0
+        const alternating = Fuzz.target(Int, (n) => calls++ % 2 === 1 || n < 500, { id: "flaky-saved", revision: "1" })
+        const regression = yield* Fuzz.runTarget(alternating, { executions: 0 }).pipe(withStore(store))
+        assert.deepStrictEqual([regression._tag, regression.stats.regressions, calls], ["Flaky", 1, 2])
+        calls = 0
+        const replayed = yield* Fuzz.runTarget(alternating, { replay: found.replay })
+        assert.deepStrictEqual(
+          [replayed._tag, replayed._tag === "Flaky" && replayed.flaky[0].recheck, calls],
+          ["Flaky", { _tag: "Passed" }, 2]
+        )
+      }))
+
+    it.effect("a simulated evaluation that hits its step limit on the recheck is flaky", () =>
+      Effect.gen(function*() {
+        let runs = 0
+        const flakyDriver: Fuzz.Execution = {
+          name: "flaky-driver",
+          run: (self) =>
+            runs++ === 0
+              ? Effect.map(self, (exit) => ({ _tag: "Completed", exit }))
+              : Effect.succeed({ _tag: "Limited" })
+        }
+        const report = yield* Fuzz.run(Arbitrary.Constant(0), () => false, {
+          seed: 1,
+          executions: 1,
+          execution: flakyDriver
+        })
+        assert.deepStrictEqual(report._tag === "Flaky" && report.flaky[0].recheck, { _tag: "Limited" })
+        assert.include(Fuzz.formatReport(report)!, "Then: reached the simulation step limit")
+      }))
+  })
 })

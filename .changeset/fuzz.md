@@ -2,7 +2,7 @@
 "effect": patch
 ---
 
-Add `Fuzz`, feedback-guided fuzzing over any `Arbitrary`. It mutates the generator's random tape, keeps inputs that produce new span, cause or observation feedback, shrinks each distinct failure with the existing shrink trees, and saves failures to a corpus so they replay as regression tests.
+Add `Fuzz`, feedback-guided fuzzing over any `Arbitrary`. It mutates the generator's random tape, keeps inputs that produce new span, cause or observation feedback, shrinks each distinct failure with the existing shrink trees, and saves failures to a corpus so they replay as regression tests. Each finding is evaluated once more before it is reported; one that does not fail the same way is reported as flaky, with both outcomes.
 
 ```ts
 import { Arbitrary, Effect, Fuzz, Schema } from "effect"

@@ -211,6 +211,16 @@ export interface Deadlock {
 export type Failure<E> = Arbitrary.ReturnedFalse | Arbitrary.PropertyError<E> | Died | Deadlock
 
 /**
+ * Represents the outcome of one property evaluation: a failure, a pass, or a simulated execution that reached its
+ * step limit.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Outcome<E> = Failure<E> | { readonly _tag: "Passed" } | { readonly _tag: "Limited" }
+
+/**
  * One distinct failure.
  *
  * **Details**
@@ -220,6 +230,9 @@ export type Failure<E> = Arbitrary.ReturnedFalse | Arbitrary.PropertyError<E> | 
  * `execution` is the exploratory execution that found the failure, or `0` for a saved failure that still fails.
  * `saved` says how a corpus store kept it: `"Value"` survives generator changes, `"Tape"` replays only while the
  * target `revision` is unchanged, `"None"` means no store was provided.
+ *
+ * Before a finding is reported, its final input is evaluated once more. A finding in `Falsified.findings` failed the
+ * same way both times; one that did not is a {@link FlakyFinding}.
  *
  * @stability unstable
  * @category models
@@ -234,6 +247,23 @@ export interface Finding<out A, out E> {
   readonly execution: number
   readonly replay: Replay | undefined
   readonly saved: "Value" | "Tape" | "None"
+}
+
+/**
+ * A failure that did not fail the same way when its final input was evaluated again.
+ *
+ * **Details**
+ *
+ * `failure` is the first outcome and `recheck` the second, on the same input and, under a simulation, the same
+ * schedule. A flaky finding means the property depends on something outside its input: shared state, real time, or
+ * a mutated input. It does not stop the search.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface FlakyFinding<out A, out E> extends Finding<A, E> {
+  readonly recheck: Outcome<E>
 }
 
 /**
@@ -282,6 +312,20 @@ export interface Passed {
 export interface Falsified<out A, out E> {
   readonly _tag: "Falsified"
   readonly findings: Arr.NonEmptyReadonlyArray<Finding<A, E>>
+  readonly flaky: ReadonlyArray<FlakyFinding<A, E>>
+  readonly stats: Stats
+}
+
+/**
+ * Reports a run whose every failure was flaky: none failed the same way when evaluated again.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface Flaky<out A, out E> {
+  readonly _tag: "Flaky"
+  readonly flaky: Arr.NonEmptyReadonlyArray<FlakyFinding<A, E>>
   readonly stats: Stats
 }
 
@@ -292,7 +336,7 @@ export interface Falsified<out A, out E> {
  * @category models
  * @since 4.0.0
  */
-export type Report<A, E> = Passed | Falsified<A, E>
+export type Report<A, E> = Passed | Falsified<A, E> | Flaky<A, E>
 
 /**
  * Reports a failure of the fuzzing infrastructure rather than of the property.
@@ -537,8 +581,11 @@ export interface Execution {
  *
  * **Gotchas**
  *
- * The property may run many times on equal inputs and must give the same outcome for the same input. A corpus store
- * needs {@link target} and {@link runTarget}.
+ * The property may run many times on equal inputs and must give the same outcome for the same input. Do not mutate
+ * the input: the engine evaluates the same value again to shrink and to confirm a finding, and generated values share
+ * parts with their shrink candidates. Copy the input before passing it to an API that mutates it, and build mutable
+ * fixtures inside the property. A finding whose second evaluation differs is reported as a {@link FlakyFinding}. A
+ * corpus store needs {@link target} and {@link runTarget}.
  *
  * **Example** (Finding a magic header)
  *
@@ -586,6 +633,10 @@ export const run = <A, E = never, R = never>(
  * revision rebuild the feature map, and the search starts. New interesting inputs and each failure are saved; a
  * failure is saved before shrinking and again with the shrunk value.
  *
+ * **Gotchas**
+ *
+ * The property contract of {@link run} applies: the same outcome for the same input, and no mutation of the input.
+ *
  * @stability unstable
  * @category running
  * @since 4.0.0
@@ -610,18 +661,19 @@ export const runTarget: <A, E, R>(
 export const formatReport = <A, E>(report: Report<A, E>): string | undefined => {
   if (report._tag === "Passed") return undefined
   const stats = report.stats
+  const findings: ReadonlyArray<Finding<A, E>> = report._tag === "Falsified" ? report.findings : []
   const sources = Object.keys(stats.features).filter((source) => source !== "structural" && source !== "causes")
   const lines = [
-    `Fuzzing found ${report.findings.length} failure(s) in ${stats.executions} execution(s) (seed ${
-      Formatter.format(stats.seed)
-    })`,
+    `Fuzzing found ${findings.length} failure(s)${
+      report.flaky.length === 0 ? "" : ` and ${report.flaky.length} flaky failure(s)`
+    } in ${stats.executions} execution(s) (seed ${Formatter.format(stats.seed)})`,
     `Feedback: ${sources.length === 0 ? "structural exploration" : sources.join(", ")}`
   ]
-  for (const finding of report.findings) {
+  const describe = (finding: Finding<A, E>, title: string, failure: string) => {
     lines.push(
-      `- ${finding.signature} after ${finding.shrinks} shrink(s)`,
+      title,
       `  Input: ${Formatter.format(finding.input, { space: 2 })}`,
-      `  Failure: ${describeFailure(finding.failure)}`
+      failure
     )
     if (finding.replay !== undefined) lines.push(`  Replay: ${finding.replay}`)
     if (finding.saved === "Tape") {
@@ -630,8 +682,31 @@ export const formatReport = <A, E>(report: Report<A, E>): string | undefined => 
       )
     }
   }
+  for (const finding of findings) {
+    describe(
+      finding,
+      `- ${finding.signature} after ${finding.shrinks} shrink(s)`,
+      `  Failure: ${describeFailure(finding.failure)}`
+    )
+  }
+  for (const finding of report.flaky) {
+    describe(
+      finding,
+      `- FLAKY ${finding.signature} after ${finding.shrinks} shrink(s): the same input then gave ${
+        Internal.signatureOf(finding.recheck)
+      }`,
+      `  First: ${describeFailure(finding.failure)}\n  Then: ${describeOutcome(finding.recheck)}`
+    )
+  }
   return lines.join("\n")
 }
+
+const describeOutcome = (outcome: Outcome<unknown>): string =>
+  outcome._tag === "Passed"
+    ? "passed"
+    : outcome._tag === "Limited"
+    ? "reached the simulation step limit"
+    : describeFailure(outcome)
 
 const describeFailure = (failure: Failure<unknown>): string => {
   switch (failure._tag) {

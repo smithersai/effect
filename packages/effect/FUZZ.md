@@ -80,6 +80,11 @@ Fuzz.run(arbitrary, property, { replay: finding.replay })
 // Falsified while the bug exists, Passed once it is fixed.
 ```
 
+Before a finding is reported, its final input is evaluated once more. A finding in `report.findings` failed with the
+same signature both times. One that did not is a flaky finding, in `report.flaky`, with both outcomes: `failure` and
+`recheck`. A run whose every failure was flaky returns a `Flaky` report, never `Falsified`; `formatReport` marks each
+one `FLAKY`. Only confirmed findings count toward `maxFindings`.
+
 ## Keeping what it finds
 
 `Fuzz.run` keeps its corpus in memory. To keep failures between runs, give the property a stable identity with
@@ -184,6 +189,11 @@ runs its finalizers inside the world with another `maxSteps`; finalizers still r
 For a seed, execution `k` is the same on every machine: the fuzzer's own random source chooses inputs and mutations,
 and `duration` only decides how many executions happen. A property that reads `Date.now`, `Math.random`, real I/O or
 shared mutable state breaks this, exactly as it breaks `checkEffect` replay.
+
+Do not mutate the input. The engine evaluates the same value again to shrink and to confirm a finding, and a generated
+value shares parts with its shrink candidates, so a property that sorts its input array in place changes the next
+candidate. Copy first: `(xs) => isSorted(mySort([...xs]))`. Build mutable fixtures inside the property. A property
+that breaks this shows up as a flaky finding.
 
 ## Design notes
 
