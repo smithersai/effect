@@ -165,6 +165,13 @@ A reads balance 100 | B reads balance 100 | B writes balance 99, pays 1 | A writ
 
 The world is closed: real I/O, native timers, `Date.now`, `Math.random` and promises from outside Effect escape it.
 
+Virtual time is kept in integer nanoseconds, so `Effect.sleep("500 micros")` advances `Clock.currentTimeNanos` by
+exactly 500,000; `currentTimeMillis` is whole milliseconds, like `Date.now`. `maxSteps` (default 100,000) counts both
+dispatched tasks and timer wakes, so a loop of sleeps ends as a discard. A long evaluation yields the fuzz fiber every
+4,096 steps, so interrupting the run stops it. After a deadlock or a step limit, the driver interrupts the program and
+runs its finalizers inside the world with another `maxSteps`; finalizers still running after that are a
+`FuzzError("Execution")` that names `maxSteps`, never a finding with resources left half released.
+
 ## Determinism and its limits
 
 For a seed, execution `k` is the same on every machine: the fuzzer's own random source chooses inputs and mutations,

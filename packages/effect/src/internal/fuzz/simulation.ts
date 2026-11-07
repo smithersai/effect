@@ -8,13 +8,19 @@ import type * as Fuzz from "../../Fuzz.ts"
 import * as Scheduler from "../../Scheduler.ts"
 
 interface Timer {
-  readonly deadline: number
+  readonly deadline: bigint
   readonly sequence: number
   readonly wake: () => void
 }
 
 /** @internal */
 export type Outcome = "Completed" | "Deadlock" | "Limited"
+
+/**
+ * Steps the driver runs before it yields its own fiber, so an interruption of the fuzz run is observed while a long
+ * evaluation is still running.
+ */
+const stepsPerSlice = 4096
 
 /**
  * One closed world: a scheduler whose dispatchers share a single priority/FIFO queue, a virtual clock, and preemption
@@ -33,7 +39,8 @@ export class World {
   readonly slices = new WeakMap<Fiber.Fiber<unknown, unknown>, number>()
   readonly schedule: Fuzz.ScheduleTape
   readonly quanta: ReadonlyArray<number>
-  now = 0
+  // Virtual time in integer nanoseconds, so sub-millisecond sleeps keep their precision.
+  now = BigInt(0)
   sequence = 0
   steps = 0
   limit: number
@@ -70,18 +77,22 @@ export class World {
   }
 
   readonly clock: Clock.Clock = {
-    currentTimeMillisUnsafe: () => this.now,
-    currentTimeMillis: Effect.sync(() => this.now),
-    currentTimeNanosUnsafe: () => BigInt(this.now) * BigInt(1_000_000),
-    currentTimeNanos: Effect.sync(() => BigInt(this.now) * BigInt(1_000_000)),
-    monotonicTimeNanosUnsafe: () => BigInt(this.now) * BigInt(1_000_000),
-    monotonicTimeNanos: Effect.sync(() => BigInt(this.now) * BigInt(1_000_000)),
+    // Whole milliseconds, like `Date.now`.
+    currentTimeMillisUnsafe: () => Number(this.now / BigInt(1_000_000)),
+    currentTimeMillis: Effect.sync(() => Number(this.now / BigInt(1_000_000))),
+    currentTimeNanosUnsafe: () => this.now,
+    currentTimeNanos: Effect.sync(() => this.now),
+    monotonicTimeNanosUnsafe: () => this.now,
+    monotonicTimeNanos: Effect.sync(() => this.now),
     sleep: (duration) =>
       Effect.callback<void>((resume) => {
-        const millis = Duration.toMillis(duration)
         // An infinite sleep never wakes; with nothing else to run it is a deadlock.
-        if (millis === Infinity) return
-        const timer: Timer = { deadline: this.now + millis, sequence: this.sequence++, wake: () => resume(Effect.void) }
+        if (!Duration.isFinite(duration)) return
+        const timer: Timer = {
+          deadline: this.now + Duration.toNanosUnsafe(duration),
+          sequence: this.sequence++,
+          wake: () => resume(Effect.void)
+        }
         let index = this.timers.length
         while (index > 0 && this.timers[index - 1].deadline > timer.deadline) index--
         this.timers.splice(index, 0, timer)
@@ -109,23 +120,41 @@ export class World {
   }
 
   /**
-   * Runs queued tasks until the fiber exits. When no task is queued, virtual time jumps to the earliest timer and wakes
-   * every timer due then, in registration order.
+   * Runs queued tasks until the fiber exits, at most `slice` loop turns at a time. When no task is queued, virtual time
+   * jumps to the earliest timer and wakes every timer due then, in registration order. A wake resumes its fiber
+   * synchronously, so each wake counts as a step like a task: a loop of sleeps reaches the limit too. The limit is
+   * checked before a task leaves the queue, so a limited world keeps every pending continuation.
    */
-  run(fiber: Fiber.Fiber<unknown, unknown>): Outcome {
-    while (fiber.pollUnsafe() === undefined) {
+  run(fiber: Fiber.Fiber<unknown, unknown>, slice: number): Outcome | "Paused" {
+    for (let turn = 0; fiber.pollUnsafe() === undefined; turn++) {
+      if (this.steps >= this.limit) return "Limited"
+      if (turn === slice) return "Paused"
       const task = this.dequeue()
       if (task !== undefined) {
-        if (++this.steps > this.limit) return "Limited"
+        this.steps++
         task()
         continue
       }
       const first = this.timers[0]
       if (first === undefined) return "Deadlock"
       this.now = first.deadline
-      while (this.timers.length > 0 && this.timers[0].deadline === this.now) this.timers.shift()!.wake()
+      while (this.timers.length > 0 && this.timers[0].deadline === this.now) {
+        if (this.steps >= this.limit) return "Limited"
+        this.steps++
+        this.timers.shift()!.wake()
+      }
     }
     return "Completed"
+  }
+
+  /**
+   * Interrupts a stuck or limited root and runs its finalizers inside the world with a fresh budget of `steps`. Returns
+   * `"Limited"` when finalizers were still running at the end of that budget.
+   */
+  release(fiber: Fiber.Fiber<unknown, unknown>, steps: number): Outcome {
+    fiber.interruptUnsafe()
+    this.limit = this.steps + steps
+    return this.run(fiber, Infinity) as Outcome
   }
 }
 
@@ -147,15 +176,32 @@ export const execution = (options?: {
           false
         )
         const fiber = Effect.runForkWith(context)(self as Effect.Effect<Exit.Exit<unknown, unknown>>)
-        const outcome = world.run(fiber)
-        if (outcome === "Completed") {
-          return Effect.map(fiber.pollUnsafe()!, (exit): Fuzz.ExecutionResult => ({ _tag: "Completed", exit }))
-        }
-        // Release what the stuck program holds, with a fresh step budget, so its finalizers run inside the world.
-        fiber.interruptUnsafe()
-        world.limit = world.steps + maxSteps
-        world.run(fiber)
-        return Effect.succeed<Fuzz.ExecutionResult>({ _tag: outcome })
+        const drive = (): Effect.Effect<Outcome> =>
+          Effect.suspend(() => {
+            const outcome = world.run(fiber, stepsPerSlice)
+            return outcome === "Paused" ? Effect.flatMap(Effect.yieldNow, drive) : Effect.succeed(outcome)
+          })
+        return drive().pipe(
+          // Interrupting the fuzz run releases what the evaluation holds before the interruption propagates.
+          Effect.onInterrupt(() => Effect.sync(() => world.release(fiber, maxSteps))),
+          Effect.flatMap((outcome): Effect.Effect<Fuzz.ExecutionResult> => {
+            if (outcome === "Completed") {
+              return Effect.map(fiber.pollUnsafe()!, (exit): Fuzz.ExecutionResult => ({ _tag: "Completed", exit }))
+            }
+            // Release what the stuck program holds, so its finalizers run inside the world. A finalizer that is still
+            // running when the budget ends would be abandoned half done: that is a driver failure, not a finding.
+            if (world.release(fiber, maxSteps) === "Limited") {
+              return Effect.die(
+                new Error(
+                  `the simulation interrupted a ${
+                    outcome === "Deadlock" ? "deadlocked" : "step-limited"
+                  } evaluation, but its finalizers did not finish within ${maxSteps} more steps; raise maxSteps`
+                )
+              )
+            }
+            return Effect.succeed({ _tag: outcome })
+          })
+        )
       })
   }
 }

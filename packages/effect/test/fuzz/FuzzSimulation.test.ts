@@ -169,4 +169,110 @@ describe("FuzzSimulation", () => {
     assert.deepStrictEqual(order, ["early 1", "early 2", "late 1", "late 2", "last"])
     assert.isUndefined(world.dequeue())
   })
+
+  it.effect("finalizers that take many steps run to completion after a deadlock or a step limit", () =>
+    Effect.gen(function*() {
+      let released = 0
+      const slowRelease = Effect.andThen(
+        Effect.repeat(Effect.yieldNow, { times: 99 }),
+        Effect.sync(() => released++)
+      )
+      const zero: Fuzz.ScheduleTape = { next: () => 0 }
+      const stuck = Effect.exit(Effect.ensuring(Effect.never, slowRelease))
+      const deadlock = yield* FuzzSimulation.execution({ maxSteps: 500 }).run(stuck, zero)
+      assert.deepStrictEqual([deadlock._tag, released], ["Deadlock", 1])
+      const spinning = Effect.exit(Effect.ensuring(Effect.forever(Effect.yieldNow), slowRelease))
+      const limited = yield* FuzzSimulation.execution({ maxSteps: 500, maxOpsBeforeYield: 64 }).run(spinning, zero)
+      assert.deepStrictEqual([limited._tag, released], ["Limited", 2])
+    }))
+
+  it.effect("finalizers that cannot finish within the cleanup budget are an Execution error, not a finding", () =>
+    Effect.gen(function*() {
+      let released = 0
+      const slowRelease = Effect.andThen(
+        Effect.repeat(Effect.yieldNow, { times: 99 }),
+        Effect.sync(() => released++)
+      )
+      const execution = FuzzSimulation.execution({ maxSteps: 5 })
+      const error = yield* Effect.flip(
+        Fuzz.run(Arbitrary.Constant(0), () => Effect.as(Effect.ensuring(Effect.never, slowRelease), true), {
+          execution,
+          seed: 1,
+          executions: 1
+        })
+      )
+      assert.deepStrictEqual([error.reason, error.message.includes("deadlocked"), released], ["Execution", true, 0])
+      const spinning = yield* Effect.flip(
+        Fuzz.run(
+          Arbitrary.Constant(0),
+          () => Effect.as(Effect.ensuring(Effect.forever(Effect.yieldNow), slowRelease), true),
+          { execution, seed: 1, executions: 1 }
+        )
+      )
+      assert.include(spinning.message, "step-limited evaluation, but its finalizers did not finish within 5 more steps")
+    }))
+
+  it.effect("virtual time keeps sub-millisecond precision", () =>
+    Effect.gen(function*() {
+      const program = Effect.gen(function*() {
+        yield* Effect.sleep("500 micros")
+        const clock = yield* Clock.Clock
+        const half = [yield* Clock.currentTimeNanos, yield* Clock.monotonicTimeNanos, yield* Clock.currentTimeMillis]
+        yield* Effect.sleep(Duration.nanos(BigInt(1_500_001)))
+        return [
+          ...half,
+          clock.currentTimeNanosUnsafe(),
+          clock.monotonicTimeNanosUnsafe(),
+          clock.currentTimeMillisUnsafe()
+        ]
+      })
+      const result = yield* FuzzSimulation.execution().run(Effect.exit(program), { next: () => 0 })
+      assert.deepStrictEqual(result, {
+        _tag: "Completed",
+        exit: Exit.succeed([BigInt(500_000), BigInt(500_000), 0, BigInt(2_000_001), BigInt(2_000_001), 2])
+      })
+      const sleepsAndReads = yield* Fuzz.run(Arbitrary.Constant(0), () =>
+        Effect.gen(function*() {
+          yield* Effect.sleep("500 micros")
+          return (yield* Clock.currentTimeNanos) === BigInt(500_000)
+        }), { execution: FuzzSimulation.execution(), seed: 1, executions: 20 })
+      assert.strictEqual(sleepsAndReads._tag, "Passed")
+    }))
+
+  it("the step limit applies between timers due at the same time", () => {
+    const world = new Simulation.World({ next: () => 0 }, 1, 2048)
+    const woken: Array<number> = []
+    for (const sequence of [0, 1]) {
+      world.timers.push({ deadline: BigInt(1), sequence, wake: () => woken.push(sequence) })
+    }
+    const running = { pollUnsafe: () => undefined } as unknown as Fiber.Fiber<unknown, unknown>
+    assert.deepStrictEqual([world.run(running, Infinity), woken], ["Limited", [0]])
+  })
+
+  it.effect("timer wakes count toward maxSteps, so a sleep loop is limited", () =>
+    Effect.gen(function*() {
+      let wakes = 0
+      const loop = Effect.gen(function*() {
+        while (true) {
+          // A guard so the old, unbounded pump ends; the limit must stop the loop long before it.
+          if (++wakes > 100_000) return yield* Effect.die("unbounded sleep loop")
+          yield* Effect.sleep("1 millis")
+        }
+      })
+      const result = yield* FuzzSimulation.execution({ maxSteps: 5 }).run(Effect.exit(loop), { next: () => 0 })
+      assert.strictEqual(result._tag, "Limited")
+      assert.isTrue(wakes <= 6, `${wakes} wakes`)
+    }))
+
+  it.live("a long simulation can be interrupted", () =>
+    Effect.gen(function*() {
+      const execution = FuzzSimulation.execution({ maxSteps: 20_000_000 })
+      const started = Date.now()
+      const fiber = yield* Effect.forkChild(
+        execution.run(Effect.exit(Effect.forever(Effect.yieldNow)), { next: () => 0 })
+      )
+      yield* Effect.sleep("50 millis")
+      yield* Fiber.interrupt(fiber)
+      assert.isTrue(Date.now() - started < 2_000, `${Date.now() - started} ms`)
+    }), 120_000)
 })
