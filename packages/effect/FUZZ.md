@@ -203,6 +203,9 @@ shared mutable state breaks this, exactly as it breaks `checkEffect` replay.
   `FuzzError`.
 - **`checkEffect` is untouched.** `Fuzz` lives in its own module with its own evaluation and shrink walk, so ordinary
   property checks pay nothing.
+- **Corpus files are text, version 2.** Free-text fields (`revision`, `signature`, `codec`, `value`) are JSON string
+  literals, so a codec value with newlines stays in its field. Each field appears once; `null-prototype` is `true` or
+  `false`; `bias` is 2 to 6. Version 1 files, which wrote those fields raw, still load.
 - **Left out on purpose:** per-execution timeouts (cooperative interruption cannot stop synchronous code), tape-level
   shrinking of values (the shrink trees already do it), corpus merge and minimization, parallel executions inside one
   run, and comparison-operand feedback.

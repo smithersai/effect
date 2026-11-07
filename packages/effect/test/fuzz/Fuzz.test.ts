@@ -582,4 +582,94 @@ describe("Fuzz", () => {
         assert.deepStrictEqual([error.reason, error.message.includes("Input k")], ["Corpus", true])
       }))
   })
+
+  describe("boundaries", () => {
+    const input: Format.Input = {
+      size: 10,
+      bias: 2,
+      nullPrototype: false,
+      key: 1,
+      words: [],
+      scheduleKey: 0,
+      schedule: []
+    }
+    const token = (signature: string, path: ReadonlyArray<number> = []) =>
+      Format.encodeReplay({ input, path, signature })
+
+    it.effect("a codec value with newlines and field-looking lines replays as the same value", () =>
+      Effect.gen(function*() {
+        const text = "a\nb\nkind input\nvalue c"
+        const raw: Fuzz.Codec<string> = { id: "raw\ncodec", encode: (value) => value, decode: (value) => value }
+        const target = Fuzz.target(Arbitrary.Constant(text), (value) => value !== text, {
+          id: "multiline",
+          revision: "1\nkind input",
+          codec: raw
+        })
+        const store = Fuzz.memoryCorpus()
+        assert.strictEqual(
+          firstFinding(yield* Fuzz.runTarget(target, { seed: 1, executions: 10 }).pipe(withStore(store))).input,
+          text
+        )
+        const regression = yield* Fuzz.runTarget(target, { executions: 0 }).pipe(withStore(store))
+        assert.deepStrictEqual([firstFinding(regression).input, regression.stats.regressions], [text, 1])
+      }))
+
+    it.effect("store defects are Corpus errors", () =>
+      Effect.gen(function*() {
+        const target = Fuzz.target(ints, () => true, { id: "defects", revision: "1" })
+        const stores: ReadonlyArray<Fuzz.Store> = [
+          {
+            load: () => {
+              throw new Error("load threw")
+            },
+            save: () => Effect.void
+          },
+          { load: () => Effect.die(new Error("load died")), save: () => Effect.void },
+          { load: () => Effect.succeed([]), save: () => Effect.die(new Error("save died")) }
+        ]
+        for (const store of stores) {
+          const exit = yield* Effect.exit(Fuzz.runTarget(target, { seed: 1, executions: 10 }).pipe(withStore(store)))
+          assert.isTrue(Exit.isFailure(exit) && Cause.hasFails(exit.cause), "a defect escaped the FuzzError channel")
+          const error = yield* Effect.flip(Fuzz.runTarget(target, { seed: 1, executions: 10 }).pipe(withStore(store)))
+          assert.strictEqual(error.reason, "Corpus")
+        }
+      }))
+
+    it.effect("a dying shrink pull while following a replay path is a Generation error", () =>
+      Effect.gen(function*() {
+        const shrinkBug = Arbitrary.schema(Int, {
+          shrink: () => {
+            throw new Error("lazy shrink defect")
+          }
+        })
+        const exit = yield* Effect.exit(Fuzz.run(shrinkBug, () => false, { replay: token("ReturnedFalse", [0]) }))
+        assert.isTrue(Exit.isFailure(exit) && Cause.hasFails(exit.cause), "a defect escaped the FuzzError channel")
+        const error = yield* Effect.flip(Fuzz.run(shrinkBug, () => false, { replay: token("ReturnedFalse", [0]) }))
+        assert.deepStrictEqual([error.reason, error.message.includes("lazy shrink defect")], ["Generation", true])
+      }))
+
+    it.effect("a replay token must name a failure", () =>
+      Effect.gen(function*() {
+        for (const signature of ["Passed", "Limited", "Died:", ""]) {
+          const error = yield* Effect.flip(Fuzz.run(ints, () => true, { replay: token(signature) }))
+          assert.strictEqual(error.reason, "Configuration", signature)
+        }
+      }))
+
+    it.effect("an in-memory target never calls its codec", () =>
+      Effect.gen(function*() {
+        const throwing: Fuzz.Codec<number> = {
+          id: "throwing",
+          encode: () => {
+            throw new Error("encode called")
+          },
+          decode: () => {
+            throw new Error("decode called")
+          }
+        }
+        const target = Fuzz.target(Arbitrary.Constant(0), () => false, { id: "memory", revision: "1", codec: throwing })
+        const finding = firstFinding(yield* Fuzz.runTarget(target, { seed: 1, executions: 10 }))
+        assert.deepStrictEqual([finding.signature, finding.saved], ["ReturnedFalse", "None"])
+      }))
+  })
 })

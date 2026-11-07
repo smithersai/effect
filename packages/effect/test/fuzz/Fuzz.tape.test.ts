@@ -121,13 +121,15 @@ describe("Fuzz tape", () => {
       input: { size: 0, bias: 2, nullPrototype: false, key: 0, words: [], scheduleKey: 0, schedule: [] },
       path: []
     })
-    assert.throws(() => Format.decodeEntry("effect-fuzz 2\n"), /first line/)
-    assert.throws(() => Format.decodeEntry(valid.replace("revision 1\n", "")), /missing field "revision"/)
+    assert.throws(() => Format.decodeEntry("effect-fuzz 3\n"), /first line/)
+    assert.throws(() => Format.decodeEntry(valid.replace("revision \"1\"\n", "")), /missing field "revision"/)
     assert.throws(() => Format.decodeEntry(valid.replace("kind input", "kind other")), /unknown kind/)
     assert.throws(() => Format.decodeEntry(valid.replace("size 0", "size -1")), /non-negative integer/)
     assert.throws(() => Format.decodeEntry(valid.replace("size 0", "size 1e300")), /non-negative integer/)
-    assert.strictEqual(Format.decodeEntry(valid.replace("revision 1", "revision")).revision, "")
-    assert.strictEqual(Format.decodeEntry(valid.replace("revision 1", "revision ")).revision, "")
+    assert.throws(() => Format.decodeEntry(valid.replace("revision \"1\"", "revision 1")), /not a string/)
+    assert.strictEqual(Format.decodeEntry(valid.replace("revision \"1\"", "revision \"\"")).revision, "")
+    const legacy = valid.replace("effect-fuzz 2", "effect-fuzz 1").replace("revision \"1\"", "revision")
+    assert.strictEqual(Format.decodeEntry(legacy).revision, "")
     assert.throws(() => Format.decodeEntry(valid.replace("path ", "path x")), /non-negative integer/)
     assert.deepStrictEqual(Format.decodeEntry(valid.replace("path ", "path")).path, [])
   })
@@ -145,8 +147,74 @@ describe("Fuzz tape", () => {
   })
 
   it("hashes are stable", () => {
-    assert.strictEqual(Tape.hashHex("failure\u0000ReturnedFalse"), Tape.hashHex("failure\u0000ReturnedFalse"))
+    // The key of the committed example failure (vitest/test/__fuzz__), written by an earlier build. A hash change would
+    // orphan every committed failure file.
+    assert.strictEqual(Tape.hashHex("failure\u0000Died:RangeError"), "5221cfd5c623c984")
     assert.notStrictEqual(Tape.hashHex("a"), Tape.hashHex("b"))
     assert.strictEqual(Tape.hashHex("a").length, 16)
+  })
+
+  it("entries reject duplicate fields, bad booleans and illegal headers", () => {
+    const valid = Format.encodeEntry({
+      kind: "failure",
+      revision: "1",
+      input: { size: 0, bias: 2, nullPrototype: false, key: 0, words: [], scheduleKey: 0, schedule: [] },
+      signature: "ReturnedFalse",
+      path: []
+    })
+    assert.throws(() => Format.decodeEntry(valid + "kind input\n"), /duplicate field "kind"/)
+    assert.throws(
+      () => Format.decodeEntry(valid.replace("null-prototype false", "null-prototype yes")),
+      /true or false/
+    )
+    assert.throws(() => Format.decodeEntry(valid.replace("bias 2", "bias 9")), /bias/)
+    assert.throws(() => Format.decodeEntry(valid.replace(/^signature .*\n/m, "")), /missing field "signature"/)
+  })
+
+  it("version 1 entries still decode", () => {
+    const v1 = [
+      "effect-fuzz 1",
+      "kind failure",
+      "revision 1",
+      "size 4",
+      "bias 3",
+      "null-prototype false",
+      "key 7",
+      "tape AQAAAA",
+      "schedule-key 0",
+      "schedule ",
+      "signature Died:RangeError",
+      "path 0.1",
+      "codec json",
+      "value [[127,69,70,0]]",
+      "# Died:RangeError",
+      ""
+    ].join("\n")
+    assert.deepStrictEqual(Format.decodeEntry(v1), {
+      kind: "failure",
+      revision: "1",
+      input: { size: 4, bias: 3, nullPrototype: false, key: 7, words: [1], scheduleKey: 0, schedule: [] },
+      signature: "Died:RangeError",
+      path: [0, 1],
+      codec: "json",
+      value: "[[127,69,70,0]]"
+    })
+  })
+
+  it("replay tokens validate every field", () => {
+    const fields = [1, 2, false, 3, "", 5, "", [0], "ReturnedFalse"]
+    const token = (json: ReadonlyArray<unknown>) => "fuzz1:" + Buffer.from(JSON.stringify(json)).toString("base64url")
+    assert.strictEqual(Format.decodeReplay(token(fields)).signature, "ReturnedFalse")
+    const broken: ReadonlyArray<readonly [string, ReadonlyArray<unknown>]> = [
+      ["length", fields.slice(0, 8)],
+      ["null-prototype", fields.map((field, index) => index === 2 ? "false" : field)],
+      ["bias", fields.map((field, index) => index === 1 ? 7 : field)],
+      ["size", fields.map((field, index) => index === 0 ? "1" : field)],
+      ["path", fields.map((field, index) => index === 7 ? "0" : field)],
+      ["tape", fields.map((field, index) => index === 4 ? 0 : field)],
+      ["signature", fields.map((field, index) => index === 8 ? "Passed" : field)],
+      ["signature", fields.map((field, index) => index === 8 ? 1 : field)]
+    ]
+    for (const [label, json] of broken) assert.throws(() => Format.decodeReplay(token(json)), /./, label)
   })
 })

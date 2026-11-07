@@ -29,14 +29,19 @@ export interface Entry {
   readonly note?: string | undefined
 }
 
-const header = "effect-fuzz 1"
+const header = "effect-fuzz 2"
+const legacyHeader = "effect-fuzz 1"
+
+// Version 2 writes every free-text field as a JSON string literal, so a newline or a field-looking line in a codec
+// value, a revision or a codec id stays inside its field. Version 1 wrote them raw and is still read.
+const text = (value: string): string => JSON.stringify(value)
 
 /** @internal */
 export function encodeEntry(entry: Entry): string {
   const lines = [
     header,
     `kind ${entry.kind}`,
-    `revision ${entry.revision}`,
+    `revision ${text(entry.revision)}`,
     `size ${entry.input.size}`,
     `bias ${entry.input.bias}`,
     `null-prototype ${entry.input.nullPrototype}`,
@@ -45,9 +50,9 @@ export function encodeEntry(entry: Entry): string {
     `schedule-key ${entry.input.scheduleKey}`,
     `schedule ${Tape.encodeWords(entry.input.schedule)}`
   ]
-  if (entry.signature !== undefined) lines.push(`signature ${entry.signature}`)
+  if (entry.signature !== undefined) lines.push(`signature ${text(entry.signature)}`)
   lines.push(`path ${entry.path.join(".")}`)
-  if (entry.codec !== undefined) lines.push(`codec ${entry.codec}`, `value ${entry.value}`)
+  if (entry.codec !== undefined) lines.push(`codec ${text(entry.codec)}`, `value ${text(entry.value!)}`)
   if (entry.note !== undefined) lines.push(...entry.note.split("\n").map((line) => `# ${line}`))
   return lines.join("\n") + "\n"
 }
@@ -64,44 +69,80 @@ function path(text: string): ReadonlyArray<number> {
   return text === "" ? [] : text.split(".").map(natural)
 }
 
+function boolean(text: string): boolean {
+  if (text !== "true" && text !== "false") throw new Error(`expected true or false, got "${text}"`)
+  return text === "true"
+}
+
+// The bias factors the search generates; any other value cannot come from this engine.
+function bias(value: number): number {
+  if (value < 2 || value > 6) throw new Error(`expected a bias between 2 and 6, got ${value}`)
+  return value
+}
+
+const failureSignature = /^(ReturnedFalse|Deadlock|PropertyError:.+|Died:.+)$/
+
 /**
- * Parses an entry written by {@link encodeEntry}. Lines starting with `#` are notes for people and are ignored.
+ * Checks that a signature names a failure, so a token or a corpus entry cannot turn a pass into a finding.
  *
  * @internal
  */
-export function decodeEntry(text: string): Entry {
-  const lines = text.split("\n")
-  if (lines[0] !== header) throw new Error(`expected "${header}" on the first line`)
+export function signature(value: string): string {
+  if (!failureSignature.test(value)) throw new Error(`"${value}" is not a failure signature`)
+  return value
+}
+
+/**
+ * Parses an entry written by {@link encodeEntry}. Lines starting with `#` are notes for people and are ignored. A
+ * field may appear once.
+ *
+ * @internal
+ */
+export function decodeEntry(source: string): Entry {
+  const lines = source.split("\n")
+  if (lines[0] !== header && lines[0] !== legacyHeader) throw new Error(`expected "${header}" on the first line`)
+  const legacy = lines[0] === legacyHeader
   const fields = new Map<string, string>()
   for (let index = 1; index < lines.length; index++) {
     const line = lines[index]
     if (line === "" || line.startsWith("#")) continue
     const space = line.indexOf(" ")
-    fields.set(space === -1 ? line : line.slice(0, space), space === -1 ? "" : line.slice(space + 1))
+    const name = space === -1 ? line : line.slice(0, space)
+    if (fields.has(name)) throw new Error(`duplicate field "${name}"`)
+    fields.set(name, space === -1 ? "" : line.slice(space + 1))
   }
   const field = (name: string): string => {
     const value = fields.get(name)
     if (value === undefined) throw new Error(`missing field "${name}"`)
     return value
   }
+  const string = (name: string): string => {
+    const raw = field(name)
+    if (legacy) return raw
+    const value: unknown = JSON.parse(raw)
+    if (typeof value !== "string") throw new Error(`field "${name}" is not a string`)
+    return value
+  }
+  const optional = (name: string): string | undefined => fields.has(name) ? string(name) : undefined
   const kind = field("kind")
   if (kind !== "input" && kind !== "failure") throw new Error(`unknown kind "${kind}"`)
+  const codec = optional("codec")
   return {
     kind,
-    revision: field("revision"),
+    revision: string("revision"),
     input: {
       size: natural(field("size")),
-      bias: natural(field("bias")),
-      nullPrototype: field("null-prototype") === "true",
+      bias: bias(natural(field("bias"))),
+      nullPrototype: boolean(field("null-prototype")),
       key: natural(field("key")),
       words: Tape.decodeWords(field("tape")),
       scheduleKey: natural(field("schedule-key")),
       schedule: Tape.decodeWords(field("schedule"))
     },
-    signature: fields.get("signature"),
+    signature: kind === "failure" ? signature(string("signature")) : optional("signature"),
     path: path(field("path")),
-    codec: fields.get("codec"),
-    value: fields.get("value")
+    codec,
+    value: codec === undefined ? undefined : string("value")
   }
 }
 
@@ -135,19 +176,31 @@ export function decodeReplay(token: string): ReplayData {
   if (!token.startsWith(replayPrefix)) throw new Error(`a fuzz replay token starts with "${replayPrefix}"`)
   const decoded = Base64Url.decode(token.slice(replayPrefix.length))
   if (decoded._tag === "Failure") throw new Error("the replay token is not base64url")
-  const json = JSON.parse(new TextDecoder().decode(decoded.success))
-  const [size, bias, nullPrototype, key, words, scheduleKey, schedule, steps, signature] = json
+  const json: unknown = JSON.parse(new TextDecoder().decode(decoded.success))
+  if (!Array.isArray(json) || json.length !== 9) throw new Error("a replay token holds nine fields")
+  const [size, biasFactor, nullPrototype, key, words, scheduleKey, schedule, steps, failure] = json
+  const number = (value: unknown, name: string): number => {
+    if (typeof value !== "number") throw new Error(`the ${name} of a replay token is not a number`)
+    return natural(String(value))
+  }
+  const words32 = (value: unknown, name: string): Array<number> => {
+    if (typeof value !== "string") throw new Error(`the ${name} of a replay token is not a string`)
+    return Tape.decodeWords(value)
+  }
+  if (typeof nullPrototype !== "boolean") throw new Error("the null-prototype flag of a replay token is not a boolean")
+  if (!Array.isArray(steps)) throw new Error("the shrink path of a replay token is not an array")
+  if (typeof failure !== "string") throw new Error("the signature of a replay token is not a string")
   return {
     input: {
-      size: natural(String(size)),
-      bias: natural(String(bias)),
-      nullPrototype: nullPrototype === true,
-      key: natural(String(key)),
-      words: Tape.decodeWords(String(words)),
-      scheduleKey: natural(String(scheduleKey)),
-      schedule: Tape.decodeWords(String(schedule))
+      size: number(size, "size"),
+      bias: bias(number(biasFactor, "bias")),
+      nullPrototype,
+      key: number(key, "key"),
+      words: words32(words, "tape"),
+      scheduleKey: number(scheduleKey, "schedule key"),
+      schedule: words32(schedule, "schedule")
     },
-    path: (steps as ReadonlyArray<unknown>).map((step) => natural(String(step))),
-    signature: String(signature)
+    path: steps.map((step) => number(step, "shrink path")),
+    signature: signature(failure)
   }
 }

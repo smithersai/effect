@@ -212,12 +212,12 @@ type Outcome<E> = { readonly _tag: "Passed" } | { readonly _tag: "Limited" } | F
 const passed = { _tag: "Passed" } as const
 const limited = { _tag: "Limited" } as const
 
-const nameOf = (value: unknown): string =>
-  typeof value === "object" && value !== null
-    ? typeof (value as { _tag?: unknown })._tag === "string"
-      ? (value as { _tag: string })._tag
-      : value.constructor?.name ?? "Object"
-    : typeof value
+const nameOf = (value: unknown): string => {
+  if (typeof value !== "object" || value === null) return typeof value
+  const tag = (value as { _tag?: unknown })._tag
+  // An empty name would make a signature that no token or corpus entry accepts.
+  return typeof tag === "string" && tag !== "" ? tag : value.constructor?.name || "Object"
+}
 
 /** @internal */
 export const signatureOf = (outcome: Outcome<unknown>): string => {
@@ -399,21 +399,38 @@ const shrink = Effect.fnUntraced(
     )
 )
 
-const follow = Effect.fnUntraced(function*<A>(initial: Model.Sample<A>, path: ReadonlyArray<number>) {
-  let current = initial
-  for (const target of path) {
-    let index = 0
-    let selected: Model.Sample<A> | undefined
-    while (selected === undefined) {
-      const candidate = current.shrinks === undefined ? undefined : yield* pullNext(current.shrinks)
-      if (candidate === undefined) return undefined
-      if (candidate._tag === "Discarded") continue
-      if (index++ === target) selected = candidate
+const follow = Effect.fnUntraced(
+  function*<A>(initial: Model.Sample<A>, path: ReadonlyArray<number>) {
+    let current = initial
+    for (const target of path) {
+      let index = 0
+      let selected: Model.Sample<A> | undefined
+      while (selected === undefined) {
+        const candidate = current.shrinks === undefined ? undefined : yield* pullNext(current.shrinks)
+        if (candidate === undefined) return undefined
+        if (candidate._tag === "Discarded") continue
+        if (index++ === target) selected = candidate
+      }
+      current = selected
     }
-    current = selected
-  }
-  return current
-})
+    return current
+  },
+  (effect) =>
+    Effect.catchDefect(
+      effect,
+      (defect) => Effect.fail(fuzzError("Generation", `a shrink candidate died: ${describe(defect)}`, defect))
+    )
+)
+
+/**
+ * Calls a store method behind a defect boundary: a store that throws or dies is a `Corpus` error, like one that fails.
+ */
+const storeCall = <A>(what: string, call: () => Effect.Effect<A, FuzzError>): Effect.Effect<A, FuzzError> =>
+  Effect.suspend(call).pipe(
+    Effect.catchDefect((defect) =>
+      Effect.fail(fuzzError("Corpus", `the corpus store died while ${what}: ${describe(defect)}`, defect))
+    )
+  )
 
 // -----------------------------------------------------------------------------
 // the run
@@ -468,7 +485,9 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
   let sinceProgress = 0
 
   const save = (kind: Fuzz.StoredEntry["kind"], key: string, text: string) =>
-    store === undefined ? Effect.void : store.save(target.id, { kind, key, text })
+    store === undefined
+      ? Effect.void
+      : storeCall(`saving ${kind} ${key}`, () => store.save(target.id, { kind, key, text }))
 
   const saved: Fuzz.Finding<A, E>["saved"] = store === undefined ? "None" : codec === undefined ? "Tape" : "Value"
   const encodeValue = (value: A) =>
@@ -477,8 +496,9 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       catch: (error) => fuzzError("Codec", `the ${codec!.id} codec cannot encode a value: ${describe(error)}`, error)
     })
 
+  // Without a store nothing is persisted, so the codec is never called.
   const saveFailure = (input: Format.Input, signature: string, path: ReadonlyArray<number>, value: A) =>
-    Effect.flatMap(encodeValue(value), (encoded) =>
+    store === undefined ? Effect.void : Effect.flatMap(encodeValue(value), (encoded) =>
       save(
         "Failure",
         Tape.hashHex(`failure\u0000${signature}`),
@@ -570,7 +590,7 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
   // 1. Saved failures run first. A value fixture outlives the generator; a tape only lives as long as its revision.
   const loaded: Array<Format.Entry> = []
   if (store !== undefined) {
-    for (const stored of yield* store.load(target.id)) {
+    for (const stored of yield* storeCall("loading", () => store.load(target.id))) {
       loaded.push(
         yield* Effect.try({
           try: () => Format.decodeEntry(stored.text),
@@ -817,6 +837,7 @@ const replay = Effect.fnUntraced(function*<A, E, R>(
   const sample = generated.attempt._tag === "Generated" ? yield* follow(generated.attempt, data.path) : undefined
   if (sample === undefined) return { _tag: "Passed", stats }
   const measured = yield* evaluate(target.property, sample.value, data.input, options, [])
+  // The token's signature names a failure (decodeReplay checks it), so an equal signature is a failure outcome.
   if (signatureOf(measured.outcome) !== data.signature) return { _tag: "Passed", stats }
   const finding: Fuzz.Finding<A, E> = {
     signature: data.signature,
