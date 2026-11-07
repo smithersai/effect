@@ -408,16 +408,18 @@ const Byte = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 255 }))
 it.effect.fuzz("parse never dies", [Schema.Array(Byte)], ([bytes]) => parse(bytes).pipe(Effect.as(true)))
 ```
 
-A fuzz session searches with `Fuzz.runTarget` and saves each finding beside the test file, in
+A fuzz session searches with `Fuzz.runTarget` and saves confirmed findings after shrinking beside the test file, in
 `__fuzz__/<test file>/<test name>-<hash>/`. Commit that directory; the next plain run replays it.
 
 ```sh
 EFFECT_FUZZ="parse never dies" EFFECT_FUZZ_DURATION="60 seconds" EFFECT_FUZZ_SEED=1 vitest run
 ```
 
-`EFFECT_FUZZ=1` selects every fuzz test; `EFFECT_FUZZ_EXECUTIONS` bounds a session by executions. Returning `false`,
+`EFFECT_FUZZ` matches the bare test name; `EFFECT_FUZZ=1` selects every fuzz test; `EFFECT_FUZZ_EXECUTIONS` bounds a session by executions. Returning `false`,
 failing, or dying is a finding. The property must give the same outcome for the same input and must not mutate it: copy
 an input before passing it to an API that mutates it. A failure whose input passes when evaluated again fails the test
-as `FLAKY`. With `fuzz: { execution: FuzzSimulation.execution() }`, plain runs replay under the simulation too, and
+as `FLAKY` and is not saved as a new regression fixture. One recheck cannot guarantee later reproduction.
+Plain runs use a fresh random seed for the smoke check and ignore `fuzz` options except `execution`. Encoding failures
+save a generator tape with a codec diagnostic; decoding failures remain `Codec` errors. With `fuzz: { execution: FuzzSimulation.execution() }`, plain runs replay under the simulation too, and
 `it.effect.fuzz` lets the simulation own `Clock` and `Scheduler` instead of `TestClock`. See `FUZZ.md` in the `effect`
 package for feedback, corpus and schedule fuzzing.

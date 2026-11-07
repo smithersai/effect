@@ -111,7 +111,8 @@ const isSchemaInput = (input: ArbitraryInput): input is Schema.Schema<any> => !A
 
 /**
  * Builds the fuzz target of a test. When every input is a Schema, failures are saved as values through the Schema's
- * JSON codec, so they survive generator changes; otherwise they are saved as tapes tied to `revision`.
+ * JSON codec, so encodable values survive generator changes. Unencodable values or inputs without a codec are saved
+ * as tapes tied to `revision`.
  *
  * @internal
  */

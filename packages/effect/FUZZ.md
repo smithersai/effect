@@ -1,15 +1,15 @@
 # Fuzzing with `Fuzz`
 
 `Arbitrary.checkEffect` runs a property on a fixed number of random inputs. `Fuzz` runs the same property for as long
-as you let it, and learns: it keeps inputs that made the program do something new, mutates them, and saves every
-distinct failure so it replays as an ordinary test.
+as you let it, and learns: it keeps inputs that made the program do something new, mutates them, and, with a corpus store, saves confirmed
+failures so they replay as ordinary tests.
 
 ```
 seed ─► pick a kept input ─► mutate its random tape ─► generate the value ─► run the property
                                                                                 │
   kept inputs ◄── new feedback (spans, causes, observations, scores) ◄──────────┤
                                                                                 │
-                               failure ─► save ─► shrink (same signature) ─► save the shrunk value
+                               failure ─► shrink (same signature) ─► confirm ─► save the shrunk value
 ```
 
 ## When to use it
@@ -20,7 +20,7 @@ after a precise sequence of commands, or a fiber interleaving.
 
 The test suite in `test/fuzz/Fuzz.benchmark.test.ts` has a parser with a four-byte magic number. `checkEffect` passes
 it after 100,000 runs (seeds 1, 2 and 3). `Fuzz.run` finds the crash with each of seeds 1 to 8, in 47,749 to 701,387
-executions (median about 92,000), guided only by the `Effect.fn` spans the parser already has. Without span feedback
+executions (median 93,017.5), guided only by the `Effect.fn` spans the parser already has. Without span feedback
 (`feedback: []`) it finds nothing in 1,000,000 executions.
 
 ## A first run
@@ -34,15 +34,21 @@ const report = yield* Fuzz.run(Arbitrary.schema(Schema.Array(Byte)), (bytes) => 
   seed: 1,
   executions: 500_000
 })
-if (report._tag === "Falsified") console.log(Fuzz.formatReport(report))
+const diagnostic = Fuzz.formatReport(report)
+if (diagnostic !== undefined) console.error(diagnostic)
 ```
+
+With no explicit budget, `Fuzz.run` uses 10 seconds of wall time, longer than Vitest's default 5-second test timeout.
+Use an execution budget as above, or raise the test timeout.
 
 The property contract is the one of `checkEffect`: return `true` (or an Effect of `true`) to pass. Returning anything
 else, failing, or **dying** is a finding. Unlike `checkEffect`, a defect raised by the property is a finding (`Died`),
 because a crash is what fuzzing looks for. Interruption propagates.
 
 A run stops at the first of `duration` (default 10 seconds when no budget is given), `executions`, `plateau`
-(executions without new feedback) and `maxFindings` distinct failures (default 1).
+(executions without new feedback) and `maxFindings` confirmed distinct signatures (default 1).
+If every execution is discarded, it returns `Exhausted`; `formatReport` explains that no exploratory evaluation completed.
+A zero-execution regression-only run can still return `Passed`.
 
 ## What guides the search
 
@@ -53,7 +59,7 @@ A run stops at the first of `duration` (default 10 seconds when no budget is giv
 | `observations` | each `Fuzz.observe(label)`                                                                        | call it where reaching a stage matters     |
 | scores         | `Fuzz.score(label, value)`, maximized per label                                                   | call it to climb toward a goal             |
 | `structural`   | header and tape-length buckets                                                                    | always                                     |
-| injected       | any `Fuzz.Feedback`, such as V8 coverage                                                          | `feedback: [...]`                          |
+| injected       | any custom `Fuzz.Feedback`                                                                        | `feedback: [...]`                          |
 
 `Fuzz.observe` and `Fuzz.score` do nothing outside a fuzz execution, so they can stay in production code.
 
@@ -68,7 +74,7 @@ Fuzz.run(wide, (n) => Effect.as(Fuzz.score("closeness", -Math.abs(n - 777_777_77
 ## Findings
 
 Each finding has a `signature`: `ReturnedFalse`, `PropertyError:<tag>`, `Died:<constructor>` or `Deadlock`. The tag is
-the error's `_tag`, else its constructor name. Findings with the same signature are one finding. Shrinking uses the
+the error's `_tag`, else its constructor name. Confirmed findings with the same signature are deduplicated within a run; flaky candidates do not block later confirmed failures. Shrinking uses the
 existing Arbitrary shrink trees and accepts a smaller input only if it keeps the signature, so a `Bust` failure never
 shrinks into a `Boom`.
 
@@ -77,13 +83,16 @@ reproduce the finding:
 
 ```ts
 Fuzz.run(arbitrary, property, { replay: finding.replay })
-// Falsified while the bug exists, Passed once it is fixed.
+// Falsified when the same failure is confirmed; Passed when it no longer occurs.
+// ReplayMismatch when the tape discards or its shrink path no longer exists (stats.stale: 1).
 ```
 
 Before a finding is reported, its final input is evaluated once more. A finding in `report.findings` failed with the
 same signature both times. One that did not is a flaky finding, in `report.flaky`, with both outcomes: `failure` and
 `recheck`. A run whose every failure was flaky returns a `Flaky` report, never `Falsified`; `formatReport` marks each
-one `FLAKY`. Only confirmed findings count toward `maxFindings`.
+one `FLAKY`. Only confirmed findings count toward `maxFindings`. Confirmation is one immediate recheck: failures that
+depend on process history can agree twice and still fail to reproduce later. New flaky candidates are not persisted;
+existing fixtures are retained even if their recheck becomes flaky.
 
 ## Keeping what it finds
 
@@ -100,14 +109,21 @@ Fuzz.runTarget(target, { duration: "1 minute" }).pipe(Effect.provideService(Fuzz
 
 A store saves two kinds of entries:
 
-- **Failures are values.** A failure is saved before shrinking and saved again with the shrunk value. When the target
-  was built from a Schema, the value is encoded with `Schema.toCodecJson`, and it replays forever, whatever happens to
-  the generator. Pass `codec` to `Fuzz.target` to save values of a plain Arbitrary.
+- **Confirmed failures are saved after shrinking and rechecking.** When the target was built from a Schema, the value
+  is encoded with `Schema.toCodecJson`. A compatible codec lets it replay independently of generator changes. Pass
+  `codec` to `Fuzz.target` to save values of a plain Arbitrary. If encoding throws, the finding remains available and
+  is saved as a tape (`saved: "Tape"`); `codecError` and `formatReport` explain the fallback. An interrupted shrink
+  does not persist its candidate.
 - **Inputs are a search cache.** They are generator tapes, tied to `revision`. Change `revision` when the Arbitrary
   changes; saved tapes of another revision are skipped and counted in `stats.stale`. A failure without a codec is also
   a tape, and the report says it will not survive a generator change.
 
-`runTarget` with `executions: 0` only replays saved failures: the regression mode used by test runners.
+Failure file keys now hash the signature plus encoded value (or the revision and final tape/path when no value is
+encoded). A later failure with the same signature gets its own file instead of evicting a fixed regression. Existing
+signature-only fixture filenames still load; they need not be renamed.
+
+`runTarget` with `executions: 0` only replays saved failures: the regression mode used by test runners. Confirmed saved
+failures count toward `maxFindings`, so its default of 1 stops search until the known failure is fixed.
 
 ## `@effect/vitest`
 
@@ -123,7 +139,8 @@ it.effect.fuzz(
 ```
 
 A plain `vitest run` replays every saved failure of the test, which must now pass, then checks 100 random inputs like
-`it.effect.prop`. It writes nothing and takes as long as a property test.
+`it.effect.prop`. It writes nothing. The smoke check uses a fresh random seed; options in `fuzz` other than `execution` apply only to
+sessions. Per-evaluation test-service construction adds overhead compared with `Fuzz.run`.
 
 A fuzz session searches and saves:
 
@@ -131,12 +148,12 @@ A fuzz session searches and saves:
 EFFECT_FUZZ="parse never dies" EFFECT_FUZZ_DURATION="60 seconds" EFFECT_FUZZ_SEED=1 vitest run container.test.ts
 ```
 
-`EFFECT_FUZZ` selects tests whose name contains it, or every fuzz test when it is `1`. `EFFECT_FUZZ_EXECUTIONS` bounds
+`EFFECT_FUZZ` selects tests whose bare test name (without enclosing `describe` names) contains it, or every fuzz test when it is `1`. `EFFECT_FUZZ_EXECUTIONS` bounds
 the session by executions instead. A session raises the test timeout to the duration plus 30 seconds. A finding fails
-the test with the shrunk input, the signature and the replay token, and is saved to
+the test with the shrunk input, the signature and the replay token, and, when confirmed, is saved to
 `__fuzz__/<test file>/<test name>-<hash>/<key>` beside the test file: commit that directory. The directory name is the
 test name with punctuation replaced by `-`, then 16 hex digits of a SHA-256 of the full id, so `parse: x` and `parse x`
-never share a corpus. Search inputs go to `node_modules/.cache/effect-fuzz`.
+avoid the sanitization collisions of the readable prefix alone. Search inputs go to `node_modules/.cache/effect-fuzz`.
 
 After the fix, the plain run prints `Replayed 1 saved failure(s) of Container > parse never dies` and passes. The test
 in `packages/vitest/test/fuzz-example.test.ts` is this workflow, with its saved failure committed.
@@ -163,7 +180,7 @@ Fuzz.run(amounts, conservesMoney, { execution: FuzzSimulation.execution(), execu
 Each execution runs in a fresh closed world. Queued tasks keep the scheduler's documented order (priority, then FIFO);
 a second tape decides how many run-loop operations each fiber slice may take before the runtime preempts it. Word 0
 means the ordinary slice, so shrinking a schedule zeroes words until the failing interleaving is as cooperative as it
-can be. `Effect.sleep`, `Clock` and timeouts run on a virtual clock that jumps to the next timer when nothing is
+the shrink budget permits. `Effect.sleep`, `Clock` and timeouts run on a virtual clock that jumps to the next timer when nothing is
 runnable. A program with nothing runnable, no pending timer and an unfinished property is a `Deadlock` finding.
 
 `test/fuzz/FuzzSimulation.test.ts` has two withdrawals that read a balance, check it, and write it back. `checkEffect`
@@ -181,19 +198,22 @@ Virtual time is kept in integer nanoseconds, so `Effect.sleep("500 micros")` adv
 exactly 500,000; `currentTimeMillis` is whole milliseconds, like `Date.now`. `maxSteps` (default 100,000) counts both
 dispatched tasks and timer wakes, so a loop of sleeps ends as a discard. A long evaluation yields the fuzz fiber every
 4,096 steps, so interrupting the run stops it. After a deadlock or a step limit, the driver interrupts the program and
-runs its finalizers inside the world with another `maxSteps`; finalizers still running after that are a
-`FuzzError("Execution")` that names `maxSteps`, never a finding with resources left half released.
+runs its finalizers inside the world with another `maxSteps`. Cleanup that exceeds that budget is a
+`FuzzError("Execution")` naming `maxSteps`; cleanup that deadlocks, including an uninterruptible suspended root, is
+also an `Execution` error. The error identifies incomplete cleanup; a suspended fiber cannot be forced to release
+resources. It is not reported as a successful cleanup or an ordinary finding.
 
 ## Determinism and its limits
 
-For a seed, execution `k` is the same on every machine: the fuzzer's own random source chooses inputs and mutations,
-and `duration` only decides how many executions happen. A property that reads `Date.now`, `Math.random`, real I/O or
+With the same seed, generator, property, feedback, execution driver and empty or identical ordered corpus, the
+fuzzer makes the same choices at execution `k`. Saved inputs replay before fresh search and consume execution numbers,
+so different local caches can diverge immediately. `duration` only decides how many executions happen. A property that reads `Date.now`, `Math.random`, real I/O or
 shared mutable state breaks this, exactly as it breaks `checkEffect` replay.
 
 Do not mutate the input. The engine evaluates the same value again to shrink and to confirm a finding, and a generated
 value shares parts with its shrink candidates, so a property that sorts its input array in place changes the next
 candidate. Copy first: `(xs) => isSorted(mySort([...xs]))`. Build mutable fixtures inside the property. A property
-that breaks this shows up as a flaky finding.
+that breaks this can show up as a flaky finding; one recheck does not detect every violation.
 
 ## Design notes
 
@@ -209,8 +229,8 @@ that breaks this shows up as a flaky finding.
   only theirs give energy: structural features keep adding diverse inputs, but must not starve the entry at the
   frontier of the program (this took the benchmark from 2 of 5 seeds to 8 of 8). One in four parents is uniform, one in
   eight inputs is fresh.
-- **Infrastructure errors are not findings.** A dying generator, feedback source, store, codec or execution driver is a
-  `FuzzError`.
+- **Infrastructure errors are not findings.** A dying generator, feedback source, store or execution driver is a
+  `FuzzError`, as are decode errors and codec-id mismatches. Value-encoding errors retain the finding as a tape.
 - **`checkEffect` is untouched.** `Fuzz` lives in its own module with its own evaluation and shrink walk, so ordinary
   property checks pay nothing.
 - **Corpus files are text, version 2.** Free-text fields (`revision`, `signature`, `codec`, `value`) are JSON string

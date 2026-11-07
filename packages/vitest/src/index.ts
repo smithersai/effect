@@ -154,12 +154,13 @@ export declare namespace Vitest {
      * **Details**
      *
      * A plain `vitest run` replays every failure saved for this test, which must now pass, then checks fresh random
-     * inputs like `prop`. It writes nothing. A fuzz session searches with `Fuzz.runTarget` and saves what it finds.
-     * Start one with `EFFECT_FUZZ=<part of the test name>`, or `EFFECT_FUZZ=1` for every fuzz test, plus
+     * inputs like `prop`, using a fresh random seed. It writes nothing and ignores `fuzz` options except `execution`.
+     * A fuzz session searches with `Fuzz.runTarget` and saves confirmed findings after shrinking and rechecking.
+     * Start one with `EFFECT_FUZZ=<part of the bare test name>`, or `EFFECT_FUZZ=1` for every fuzz test, plus
      * `EFFECT_FUZZ_DURATION`, `EFFECT_FUZZ_EXECUTIONS` and `EFFECT_FUZZ_SEED`. A session raises the test timeout to the
      * duration plus 30 seconds.
      *
-     * Failures are saved beside the test file in `__fuzz__/<file name>/<id>`, to commit. Search inputs are
+     * Confirmed failures are saved beside the test file in `__fuzz__/<file name>/<id>-<hash>`, to commit. Search inputs are
      * cached in `node_modules/.cache/effect-fuzz`. Returning `false`, failing, or dying is a finding; interruption
      * interrupts the test.
      *

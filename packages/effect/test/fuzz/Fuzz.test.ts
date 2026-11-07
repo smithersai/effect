@@ -171,7 +171,8 @@ describe("Fuzz", () => {
       Effect.gen(function*() {
         const never = Arbitrary.filter(ints, () => false)
         const report = yield* fuzz(never, () => false, { executions: 100 })
-        assert.strictEqual(report._tag, "Passed")
+        assert.strictEqual(report._tag, "Exhausted")
+        assert.include(Fuzz.formatReport(report)!, "all 100 executions were discarded")
         assert.deepStrictEqual([report.stats.discards, report.stats.corpus], [100, 0])
         const half = yield* fuzz(Arbitrary.filter(ints, (n) => n % 2 === 0), (n) => n % 2 === 0, { executions: 500 })
         assert.strictEqual(half._tag, "Passed")
@@ -230,15 +231,18 @@ describe("Fuzz", () => {
       30_000
     )
 
-    it.effect("a token whose shrink path no longer exists passes", () =>
+    it.effect("a token that cannot regenerate reports ReplayMismatch", () =>
       Effect.gen(function*() {
         const finding = firstFinding(yield* fuzz(ints, (n) => n < 500))
         const data = Format.decodeReplay(finding.replay!)
         const broken = Format.encodeReplay({ ...data, path: [...data.path, 9_999] })
-        assert.strictEqual((yield* Fuzz.run(ints, (n) => n < 500, { replay: broken }))._tag, "Passed")
+        const missing = yield* Fuzz.run(ints, (n) => n < 500, { replay: broken })
+        assert.deepStrictEqual([missing._tag, missing.stats.stale], ["ReplayMismatch", 1])
+        assert.include(Fuzz.formatReport(missing)!, "cannot regenerate")
         const discarded = Format.encodeReplay({ ...data, path: [] })
         const never = Arbitrary.filter(ints, () => false)
-        assert.strictEqual((yield* Fuzz.run(never, () => false, { replay: discarded }))._tag, "Passed")
+        const rejected = yield* Fuzz.run(never, () => false, { replay: discarded })
+        assert.deepStrictEqual([rejected._tag, rejected.stats.stale], ["ReplayMismatch", 1])
       }))
 
     it.effect("an invalid token is a configuration error", () =>
@@ -424,7 +428,7 @@ describe("Fuzz", () => {
         assert.strictEqual(error.reason, "Configuration")
       }))
 
-    it.effect("a failure is saved before shrinking, then updated with the shrunk value", () =>
+    it.effect("a failure is saved only after shrinking and confirmation", () =>
       Effect.gen(function*() {
         const { saves, store } = recordingStore()
         const target = Fuzz.target(Int, (n) => n < 500, { id: "order", revision: "1" })
@@ -434,11 +438,9 @@ describe("Fuzz", () => {
         const failures = saves.filter((entry) => entry.kind === "Failure").map((entry) =>
           Format.decodeEntry(entry.text)
         )
-        assert.strictEqual(failures.length, 2)
-        assert.deepStrictEqual(failures[0].path, [])
-        assert.strictEqual(failures[0].value, String(finding.initialInput))
-        assert.isTrue(failures[1].path.length > 0)
-        assert.strictEqual(failures[1].value, "500")
+        assert.strictEqual(failures.length, 1)
+        assert.isTrue(failures[0].path.length > 0)
+        assert.strictEqual(failures[0].value, "500")
         assert.strictEqual(finding.saved, "Value")
         assert.isTrue(saves.some((entry) => entry.kind === "Input"))
       }))
@@ -526,7 +528,7 @@ describe("Fuzz", () => {
         assert.deepStrictEqual(second.stats.features, first.stats.features)
       }))
 
-    it.effect("codec problems are Codec errors", () =>
+    it.effect("decode problems and codec-id mismatches are Codec errors", () =>
       Effect.gen(function*() {
         const store = Fuzz.memoryCorpus()
         yield* Fuzz.runTarget(Fuzz.target(Int, (n) => n < 500, { id: "codec", revision: "1" }), {
@@ -553,19 +555,6 @@ describe("Fuzz", () => {
           }
         })
         assert.include((yield* Effect.flip(Fuzz.runTarget(undecodable).pipe(withStore(store)))).message, "bad value")
-        const unencodable = Fuzz.target(ints, (n) => n < 500, {
-          id: "unencodable",
-          revision: "1",
-          codec: {
-            id: "json",
-            encode: () => {
-              throw new Error("cannot encode")
-            },
-            decode: Number
-          }
-        })
-        const error = yield* Effect.flip(Fuzz.runTarget(unencodable, { seed: 1 }).pipe(withStore(store)))
-        assert.deepStrictEqual([error.reason, error.message.includes("cannot encode")], ["Codec", true])
       }))
 
     it.effect("store failures and unreadable entries are Corpus errors", () =>

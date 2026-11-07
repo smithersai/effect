@@ -17,8 +17,9 @@ import * as Internal from "../internal/fuzz/simulation.ts"
  *
  * **Details**
  *
- * `maxSteps`, default 100,000, bounds the dispatched tasks of one evaluation; an evaluation that reaches it counts as a
- * discard. `maxOpsBeforeYield`, default 2048, is the slice length for schedule word 0, the ordinary cooperative
+ * `maxSteps`, default 100,000, bounds dispatched tasks and timer wakes in one evaluation; reaching it counts as a
+ * discard when cleanup completes. Cleanup gets another `maxSteps`; exceeding it or deadlocking is an execution-driver
+ * error. `maxOpsBeforeYield`, default 2048, is the slice length for schedule word 0, the ordinary cooperative
  * schedule. Other words preempt a fiber after 3, 4, 5, 6, 8, 12, 16 or 32 run-loop operations.
  *
  * @stability unstable
@@ -41,11 +42,13 @@ export interface Options {
  * **Details**
  *
  * Queued tasks run in the order the scheduler contract documents: lower priority first, FIFO within a priority. The
- * schedule tape decides only how many operations each fiber slice runs before the runtime yields it, so every reported
- * interleaving is one the default scheduler could produce under load. `Effect.sleep`, `Clock` and timeouts use virtual
+ * schedule tape decides how many operations each fiber slice runs before the runtime yields it, exploring yield
+ * points while preserving queue ordering. `Effect.sleep`, `Clock` and timeouts use virtual
  * time: when no task is queued, time jumps to the earliest timer and every timer due then wakes, in registration order.
  * When no task is queued and no timer is pending but the property has not finished, the result is a `Deadlock`
- * finding. Shrinking zeroes schedule words, making the failing interleaving as sequential as it can be.
+ * finding if cleanup completes. Shrinking zeroes schedule words toward more cooperative scheduling within the shrink
+ * budget. Cleanup that deadlocks or exceeds its step budget raises an execution-driver error; a suspended
+ * uninterruptible root or finalizer may still retain resources.
  *
  * **Gotchas**
  *

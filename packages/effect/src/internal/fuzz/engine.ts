@@ -481,9 +481,9 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
   const rng = Tape.makeRng(seed)
   const maxOpsBeforeYield = yield* Scheduler.MaxOpsBeforeYield
 
-  // Keyed by signature. A flaky finding carries the outcome of its confirming evaluation.
-  const findings = new Map<string, Fuzz.Finding<A, E> & { readonly recheck?: Outcome<E> | undefined }>()
-  let confirmed = 0
+  // Only confirmed findings deduplicate a signature. A flaky candidate must not hide a later real failure.
+  const findings = new Map<string, Fuzz.Finding<A, E>>()
+  const flaky = new Map<string, Fuzz.FlakyFinding<A, E>>()
   const features: Record<string, number> = {}
   // Executions that produced each (feature, bucket) pair. An entry's energy is the rarity of the rarest pair it owns,
   // following AFL++'s "fast" power schedule, so the search keeps working on the frontier.
@@ -508,33 +508,48 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       ? Effect.void
       : storeCall(`saving ${kind} ${key}`, () => store.save(target.id, { kind, key, text }))
 
-  const saved: Fuzz.Finding<A, E>["saved"] = store === undefined ? "None" : codec === undefined ? "Tape" : "Value"
-  const encodeValue = (value: A) =>
-    Effect.try({
-      try: () => codec?.encode(value),
-      catch: (error) => fuzzError("Codec", `the ${codec!.id} codec cannot encode a value: ${describe(error)}`, error)
-    })
-
-  // Without a store nothing is persisted, so the codec is never called.
-  const saveFailure = (input: Format.Input, signature: string, path: ReadonlyArray<number>, value: A) =>
-    store === undefined ? Effect.void : Effect.flatMap(encodeValue(value), (encoded) =>
-      save(
-        "Failure",
-        Tape.hashHex(`failure\u0000${signature}`),
-        Format.encodeEntry({
-          kind: "failure",
-          revision: target.revision,
-          input,
-          signature,
-          path,
-          codec: codec?.id,
-          value: encoded,
-          note: `${signature}\n${encoded ?? Formatter.format(value)}`
-        })
-      ))
-
   const replayToken = (input: Format.Input, path: ReadonlyArray<number>, signature: string) =>
     Format.encodeReplay({ input, path, signature })
+
+  // Encode only confirmed failures with a store. An unencodable value still has its tape and replay token.
+  const saveFailure = Effect.fnUntraced(function*(
+    input: Format.Input,
+    signature: string,
+    path: ReadonlyArray<number>,
+    value: A
+  ): Effect.fn.Return<
+    { readonly saved: Fuzz.Finding<A, E>["saved"]; readonly codecError?: string | undefined },
+    FuzzError
+  > {
+    if (store === undefined) return { saved: "None" }
+    let encoded: string | undefined
+    let codecError: string | undefined
+    if (codec !== undefined) {
+      try {
+        encoded = codec.encode(value)
+      } catch (error) {
+        codecError = `the ${codec.id} codec cannot encode a value: ${describe(error)}`
+      }
+    }
+    const content = encoded === undefined
+      ? `${target.revision}\u0000${replayToken(input, path, signature)}`
+      : `${codec!.id}\u0000${encoded}`
+    yield* save(
+      "Failure",
+      Tape.hashHex(`failure\u0000${signature}\u0000${content}`),
+      Format.encodeEntry({
+        kind: "failure",
+        revision: target.revision,
+        input,
+        signature,
+        path,
+        codec: encoded === undefined ? undefined : codec!.id,
+        value: encoded,
+        note: `${signature}\n${encoded ?? Formatter.format(value)}`
+      })
+    )
+    return { saved: encoded === undefined ? "Tape" : "Value", codecError }
+  })
 
   // A new (feature, count bucket) pair or a better score makes an execution interesting.
   const admit = (input: Format.Input, measured: Measured<E>): boolean => {
@@ -578,26 +593,37 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
     shrinks: number,
     execution: number,
     replay: string | undefined,
-    recheck: Outcome<E> | undefined
+    recheck: Outcome<E> | undefined,
+    persistence: { readonly saved: Fuzz.Finding<A, E>["saved"]; readonly codecError?: string | undefined }
   ) => {
-    const found: Fuzz.Finding<A, E> = { signature, failure, input, initialInput, shrinks, execution, replay, saved }
-    findings.set(signature, recheck === undefined ? found : { ...found, recheck })
-    if (recheck === undefined) confirmed++
+    const found: Fuzz.Finding<A, E> = {
+      signature,
+      failure,
+      input,
+      initialInput,
+      shrinks,
+      execution,
+      replay,
+      ...persistence
+    }
+    if (recheck === undefined) findings.set(signature, found)
+    else if (!flaky.has(signature)) flaky.set(signature, { ...found, recheck })
     sinceProgress = 0
   }
 
-  const onFailure = Effect.fnUntraced(function*(input: Format.Input, failure: Fuzz.Failure<E>, value: A) {
+  const onFailure = Effect.fnUntraced(function*(input: Format.Input, failure: Fuzz.Failure<E>) {
     const signature = signatureOf(failure)
     if (findings.has(signature)) return
-    // Persist before shrinking, so an interrupted or crashing shrink cannot lose the failure.
-    yield* saveFailure(input, signature, [], value)
     const regenerated = yield* generate(generator, input, true)
     if (regenerated.attempt._tag === "Discarded") {
       return yield* Effect.fail(fuzzError("Generation", "the generator is not deterministic: a failing tape discarded"))
     }
     const shrunk = yield* shrink(regenerated.attempt, failure, input, property, resolved)
     const final = { ...input, schedule: shrunk.schedule }
-    yield* saveFailure(final, signature, shrunk.path, shrunk.sample.value)
+    const recheck = yield* confirm(property, shrunk.sample.value, final, resolved, signature)
+    const persistence = recheck === undefined
+      ? yield* saveFailure(final, signature, shrunk.path, shrunk.sample.value)
+      : { saved: "None" as const }
     finding(
       signature,
       shrunk.failure,
@@ -606,7 +632,8 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       shrunk.shrinks,
       executions,
       replayToken(final, shrunk.path, signature),
-      yield* confirm(property, shrunk.sample.value, final, resolved, signature)
+      recheck,
+      persistence
     )
   })
 
@@ -661,7 +688,8 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       0,
       0,
       entry.revision === target.revision ? replayToken(entry.input, entry.path, signature) : undefined,
-      yield* confirm(property, value, entry.input, resolved, signature)
+      yield* confirm(property, value, entry.input, resolved, signature),
+      { saved: entry.codec === undefined ? "Tape" : "Value" }
     )
   }
 
@@ -782,7 +810,7 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
   let stoppedBy: Fuzz.Stats["stoppedBy"]
   while (true) {
     // Only confirmed findings stop the search; a flaky one is kept, and the search goes on.
-    if (confirmed >= resolved.maxFindings) {
+    if (findings.size >= resolved.maxFindings) {
       stoppedBy = "Findings"
       break
     }
@@ -820,7 +848,7 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       const text = Format.encodeEntry({ kind: "input", revision: target.revision, input: canonical, path: [] })
       yield* save("Input", Tape.hashHex(text), text)
     }
-    if (measured.outcome._tag !== "Passed") yield* onFailure(canonical, measured.outcome, value)
+    if (measured.outcome._tag !== "Passed") yield* onFailure(canonical, measured.outcome)
   }
 
   const stats: Fuzz.Stats = {
@@ -833,7 +861,7 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
     stale,
     stoppedBy
   }
-  return report(Array.from(findings.values()), stats)
+  return report([...findings.values(), ...flaky.values()], stats)
 })
 
 const report = <A, E>(
@@ -848,6 +876,7 @@ const report = <A, E>(
   }
   if (Arr.isArrayNonEmpty(findings)) return { _tag: "Falsified", findings, flaky, stats }
   if (Arr.isArrayNonEmpty(flaky)) return { _tag: "Flaky", flaky, stats }
+  if (stats.executions > 0 && stats.discards === stats.executions) return { _tag: "Exhausted", stats }
   return { _tag: "Passed", stats }
 }
 
@@ -872,7 +901,7 @@ const replay = Effect.fnUntraced(function*<A, E, R>(
   }
   const generated = yield* generate(target.arbitrary.gen, data.input, true)
   const sample = generated.attempt._tag === "Generated" ? yield* follow(generated.attempt, data.path) : undefined
-  if (sample === undefined) return { _tag: "Passed", stats }
+  if (sample === undefined) return { _tag: "ReplayMismatch", stats: { ...stats, stale: 1 } }
   const measured = yield* evaluate(target.property, sample.value, data.input, options, [])
   // The token's signature names a failure (decodeReplay checks it), so an equal signature is a failure outcome.
   if (signatureOf(measured.outcome) !== data.signature) return { _tag: "Passed", stats }

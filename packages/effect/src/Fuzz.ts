@@ -5,7 +5,7 @@
  * mutable tape of random words instead of a seed. It keeps tapes that produced new feedback, mutates them, and turns
  * each distinct failure into a shrunk, deduplicated, replayable finding. Feedback is Effect-native: cause shapes, span
  * edges from `Effect.fn` and `Effect.withSpan`, and explicit {@link observe} and {@link score} calls. Platform feedback
- * such as V8 coverage plugs in as a {@link Feedback} value.
+ * can implement {@link Feedback}; no V8 coverage adapter is included.
  *
  * @stability unstable
  * @since 4.0.0
@@ -49,8 +49,8 @@ export interface Target<in out A, out E = never, out R = never> {
  * **Details**
  *
  * `id` names the wire format. A saved value with another codec id is a `FuzzError` with reason `"Codec"`, never a
- * silently skipped fixture. `encode` and `decode` are synchronous and may throw; a thrown error is also a `"Codec"`
- * error.
+ * silently skipped fixture. `encode` and `decode` are synchronous and may throw. A decode error is a `"Codec"`
+ * error; an encode error falls back to a generator tape and appears in {@link Finding.codecError}.
  *
  * @stability unstable
  * @category models
@@ -131,8 +131,10 @@ export const target: {
  * - `duration`, `executions` and `plateau` are the budget; the first one reached stops the run. Without any of them
  *   the run lasts 10 seconds. `executions` counts exploratory executions, including saved inputs replayed to rebuild
  *   the feature map. `executions: 0` only replays saved failures, which is the regression mode used by test runners.
- *   `plateau` stops after that many executions without new feedback or a new finding.
- * - `seed` fixes every choice the fuzzer makes, so a run bounded by `executions` is identical on every machine.
+ *   `plateau` stops after that many executions without new feedback or a new finding. If every exploratory execution
+ *   is discarded, the report is `Exhausted`.
+ * - `seed` fixes the fuzzer's choices for an empty or identical ordered corpus, with the same generator, property,
+ *   feedback and execution driver. Different saved inputs consume executions and can change the search.
  *   `duration` only decides how many executions happen.
  * - `size` is the maximum generation size, default 100. `maxShrinks`, default 1000, bounds shrink candidates per
  *   finding. `maxFindings`, default 1, is the number of distinct failure signatures to collect.
@@ -227,9 +229,11 @@ export type Outcome<E> = Failure<E> | { readonly _tag: "Passed" } | { readonly _
  *
  * `signature` is the deduplication key: `ReturnedFalse`, `PropertyError:<tag>`, `Died:<constructor>` or `Deadlock`,
  * where the tag is the error's `_tag`, else its constructor name, else its `typeof`. Shrinking keeps the signature.
- * `execution` is the exploratory execution that found the failure, or `0` for a saved failure that still fails.
+ * `execution` is the exploratory execution that found the failure, `0` for a saved failure that still fails, or `1`
+ * for a replay token.
  * `saved` says how a corpus store kept it: `"Value"` survives generator changes, `"Tape"` replays only while the
- * target `revision` is unchanged, `"None"` means no store was provided.
+ * target `revision` is unchanged, `"None"` means this finding was not saved. `codecError`, when present, explains why
+ * value encoding fell back to a tape.
  *
  * Before a finding is reported, its final input is evaluated once more. A finding in `Falsified.findings` failed the
  * same way both times; one that did not is a {@link FlakyFinding}.
@@ -247,6 +251,7 @@ export interface Finding<out A, out E> {
   readonly execution: number
   readonly replay: Replay | undefined
   readonly saved: "Value" | "Tape" | "None"
+  readonly codecError?: string | undefined
 }
 
 /**
@@ -255,8 +260,10 @@ export interface Finding<out A, out E> {
  * **Details**
  *
  * `failure` is the first outcome and `recheck` the second, on the same input and, under a simulation, the same
- * schedule. A flaky finding means the property depends on something outside its input: shared state, real time, or
- * a mutated input. It does not stop the search.
+ * schedule. A flaky finding indicates nondeterminism in the property or execution driver, for example shared state,
+ * real time, or a mutated input. It does not stop the search or deduplicate later confirmed failures of the same signature.
+ * New flaky candidates are not persisted as regression fixtures. A flaky recheck of an existing fixture leaves that
+ * fixture in the store.
  *
  * @stability unstable
  * @category models
@@ -273,7 +280,7 @@ export interface FlakyFinding<out A, out E> extends Finding<A, E> {
  *
  * `features` counts distinct features per feedback source. Only `structural` and `causes` mean the search explored
  * generator choices and outcome shapes, not code coverage. `regressions` counts saved failures replayed and `stale`
- * counts saved tapes skipped because their revision differs.
+ * counts saved tapes skipped because their revision differs or they no longer regenerate, including replay tokens.
  *
  * @stability unstable
  * @category models
@@ -299,6 +306,30 @@ export interface Stats {
  */
 export interface Passed {
   readonly _tag: "Passed"
+  readonly stats: Stats
+}
+
+/**
+ * Reports a search in which every execution was discarded, so no exploratory property evaluation completed.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface Exhausted {
+  readonly _tag: "Exhausted"
+  readonly stats: Stats
+}
+
+/**
+ * Reports a replay token whose generator tape discarded or whose shrink path no longer exists.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface ReplayMismatch {
+  readonly _tag: "ReplayMismatch"
   readonly stats: Stats
 }
 
@@ -336,7 +367,7 @@ export interface Flaky<out A, out E> {
  * @category models
  * @since 4.0.0
  */
-export type Report<A, E> = Passed | Falsified<A, E> | Flaky<A, E>
+export type Report<A, E> = Passed | Falsified<A, E> | Flaky<A, E> | Exhausted | ReplayMismatch
 
 /**
  * Reports a failure of the fuzzing infrastructure rather than of the property.
@@ -348,7 +379,7 @@ export type Report<A, E> = Passed | Falsified<A, E> | Flaky<A, E>
  * - `Generation`: the Arbitrary died or is not deterministic.
  * - `Feedback`: a feedback source died.
  * - `Execution`: the execution driver died.
- * - `Codec`: a value could not be encoded or decoded, or a saved value uses another codec.
+ * - `Codec`: a saved value could not be decoded or uses another codec. Encoding errors fall back to tapes.
  *
  * @stability unstable
  * @category errors
@@ -489,8 +520,8 @@ export interface StoredEntry {
  *
  * **Details**
  *
- * `save` replaces an entry with the same target, kind and key. A failure is saved before shrinking and saved again,
- * under the same key, with the shrunk value.
+ * `save` replaces an entry with the same target, kind and key. New failure keys include the signature and encoded
+ * value or final tape, so later failures preserve fixed regressions. Failures are saved after shrinking and confirmation.
  *
  * @stability unstable
  * @category corpus
@@ -577,7 +608,9 @@ export interface Execution {
  * **Details**
  *
  * The property contract is the one of `Arbitrary.checkEffect`: return `true`, or an Effect of `true`, to pass.
- * Returning anything else, failing, or dying is a finding. Interruption propagates.
+ * Returning anything else, failing, or dying is a finding. Interruption propagates. Without `duration`, `executions`
+ * or `plateau`, the budget is 10 seconds of wall time. In a test with a shorter timeout, pass an explicit execution
+ * budget or raise the test timeout, as in the bounded example below.
  *
  * **Gotchas**
  *
@@ -630,8 +663,11 @@ export const run = <A, E = never, R = never>(
  *
  * Saved failures run first: a saved value through the target codec, otherwise its tape and shrink path when the
  * revision matches. A saved failure that still fails is a finding with `execution: 0`. Then saved inputs of the same
- * revision rebuild the feature map, and the search starts. New interesting inputs and each failure are saved; a
- * failure is saved before shrinking and again with the shrunk value.
+ * revision rebuild the feature map, and the search starts. Confirmed saved failures count toward `maxFindings`, so
+ * with the default of 1 an unfixed fixture stops further search. New interesting inputs are saved as they are found;
+ * new failures are saved only after shrinking and confirmation. An interrupted shrink does not persist its candidate.
+ * Failure keys include the signature and encoded value or final tape, preserving fixed regressions when a later input
+ * fails with the same signature.
  *
  * **Gotchas**
  *
@@ -647,7 +683,7 @@ export const runTarget: <A, E, R>(
 ) => Effect.Effect<Report<A, E>, FuzzError, R> = Internal.runTarget
 
 /**
- * Formats a report with findings as a diagnostic message, returning `undefined` for a passed report.
+ * Formats findings, exhausted searches and replay mismatches as diagnostic messages; returns `undefined` for `Passed`.
  *
  * **Details**
  *
@@ -661,6 +697,14 @@ export const runTarget: <A, E, R>(
 export const formatReport = <A, E>(report: Report<A, E>): string | undefined => {
   if (report._tag === "Passed") return undefined
   const stats = report.stats
+  if (report._tag === "Exhausted") {
+    return `Fuzzing exhausted: all ${stats.executions} executions were discarded; no exploratory property evaluation completed (seed ${
+      Formatter.format(stats.seed)
+    })`
+  }
+  if (report._tag === "ReplayMismatch") {
+    return "Fuzz replay cannot regenerate its input: the generator tape discarded or its shrink path no longer exists"
+  }
   const findings: ReadonlyArray<Finding<A, E>> = report._tag === "Falsified" ? report.findings : []
   const sources = Object.keys(stats.features).filter((source) => source !== "structural" && source !== "causes")
   const lines = [
@@ -676,6 +720,7 @@ export const formatReport = <A, E>(report: Report<A, E>): string | undefined => 
       failure
     )
     if (finding.replay !== undefined) lines.push(`  Replay: ${finding.replay}`)
+    if (finding.codecError !== undefined) lines.push(`  Codec: ${finding.codecError}; saved the generator tape instead`)
     if (finding.saved === "Tape") {
       lines.push(
         "  Saved as a generator tape: it replays only until the target revision changes. Add a codec to keep it."

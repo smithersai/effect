@@ -37,50 +37,54 @@ const conservesMoney = (log: Array<string>) =>
   })
 
 describe("FuzzSimulation", () => {
-  it.effect("finds a race that checkEffect misses in 10,000 runs, and replays it deterministically", () =>
-    Effect.gen(function*() {
-      const log: Array<string> = []
-      const checked = yield* Arbitrary.checkEffect(amounts, conservesMoney(log), { runs: 10_000, seed: 1 })
-      assert.strictEqual(checked._tag, "Passed")
+  it.effect(
+    "finds a race that checkEffect misses in 10,000 runs, and replays it deterministically",
+    () =>
+      Effect.gen(function*() {
+        const log: Array<string> = []
+        const checked = yield* Arbitrary.checkEffect(amounts, conservesMoney(log), { runs: 10_000, seed: 1 })
+        assert.strictEqual(checked._tag, "Passed")
 
-      const execution = FuzzSimulation.execution()
-      const report = yield* Fuzz.run(amounts, conservesMoney(log), { execution, seed: 1, executions: 10_000 })
-      assert.strictEqual(report._tag, "Falsified")
-      if (report._tag !== "Falsified") return
-      const finding = report.findings[0]
-      assert.strictEqual(finding.signature, "ReturnedFalse")
-      // Once both withdrawals read 100, any amounts break conservation, so shrinking reaches the smallest pair.
-      assert.deepStrictEqual(finding.input, [1, 1])
+        const execution = FuzzSimulation.execution()
+        const report = yield* Fuzz.run(amounts, conservesMoney(log), { execution, seed: 1, executions: 10_000 })
+        assert.strictEqual(report._tag, "Falsified")
+        if (report._tag !== "Falsified") return
+        const finding = report.findings[0]
+        assert.strictEqual(finding.signature, "ReturnedFalse")
+        // Once both withdrawals read 100, any amounts break conservation, so shrinking reaches the smallest pair.
+        assert.deepStrictEqual(finding.input, [1, 1])
 
-      // The same token gives the same interleaving every time.
-      const interleavings = new Set<string>()
-      for (let index = 0; index < 1_000; index++) {
-        const replayed = yield* Fuzz.run(amounts, conservesMoney(log), { execution, replay: finding.replay })
-        assert.strictEqual(replayed._tag, "Falsified")
-        interleavings.add(log.join(", "))
-      }
-      assert.strictEqual(interleavings.size, 1)
-      assert.deepStrictEqual([...interleavings][0].split(", ").slice(0, 2), ["A reads 100", "B reads 100"])
+        // The same token gives the same interleaving every time.
+        const interleavings = new Set<string>()
+        for (let index = 0; index < 1_000; index++) {
+          const replayed = yield* Fuzz.run(amounts, conservesMoney(log), { execution, replay: finding.replay })
+          assert.strictEqual(replayed._tag, "Falsified")
+          interleavings.add(log.join(", "))
+        }
+        assert.strictEqual(interleavings.size, 1)
+        assert.deepStrictEqual([...interleavings][0].split(", ").slice(0, 2), ["A reads 100", "B reads 100"])
 
-      // The schedule shrinks toward cooperative scheduling: most words are zero.
-      const schedule = Format.decodeReplay(finding.replay!).input.schedule
-      assert.isTrue(schedule.filter((word) => word !== 0).length <= 2)
+        // The schedule shrinks toward cooperative scheduling: most words are zero.
+        const schedule = Format.decodeReplay(finding.replay!).input.schedule
+        assert.isTrue(schedule.filter((word) => word !== 0).length <= 2)
 
-      // Making the read and the write one atomic step fixes it.
-      const atomic = Effect.fnUntraced(function*([x, y]: readonly [number, number]) {
-        const balance = yield* Ref.make(100)
-        const paid = yield* Ref.make(0)
-        const take = (amount: number) =>
-          Effect.flatMap(
-            Ref.modify(balance, (current) => current >= amount ? [amount, current - amount] : [0, current]),
-            (taken) => Ref.update(paid, (total) => total + taken)
-          )
-        yield* Effect.all([take(x), take(y)], { concurrency: 2 })
-        return (yield* Ref.get(balance)) + (yield* Ref.get(paid)) === 100
-      })
-      const fixed = yield* Fuzz.run(amounts, atomic, { execution, seed: 1, executions: 3_000 })
-      assert.strictEqual(fixed._tag, "Passed")
-    }))
+        // Making the read and the write one atomic step fixes it.
+        const atomic = Effect.fnUntraced(function*([x, y]: readonly [number, number]) {
+          const balance = yield* Ref.make(100)
+          const paid = yield* Ref.make(0)
+          const take = (amount: number) =>
+            Effect.flatMap(
+              Ref.modify(balance, (current) => current >= amount ? [amount, current - amount] : [0, current]),
+              (taken) => Ref.update(paid, (total) => total + taken)
+            )
+          yield* Effect.all([take(x), take(y)], { concurrency: 2 })
+          return (yield* Ref.get(balance)) + (yield* Ref.get(paid)) === 100
+        })
+        const fixed = yield* Fuzz.run(amounts, atomic, { execution, seed: 1, executions: 3_000 })
+        assert.strictEqual(fixed._tag, "Passed")
+      }),
+    120_000
+  )
 
   it.effect("a program waiting forever is a deadlock", () =>
     Effect.gen(function*() {
@@ -153,7 +157,7 @@ describe("FuzzSimulation", () => {
           Effect.ensuring(Effect.sync(() => released++)),
           Effect.as(true)
         ), { execution, seed: 1, executions: 20 })
-      assert.deepStrictEqual([report._tag, report.stats.discards, released], ["Passed", 20, 20])
+      assert.deepStrictEqual([report._tag, report.stats.discards, released], ["Exhausted", 20, 20])
     }))
 
   it("dispatchers run tasks by priority, then FIFO, and flush drains the queue", () => {
@@ -210,6 +214,19 @@ describe("FuzzSimulation", () => {
         )
       )
       assert.include(spinning.message, "step-limited evaluation, but its finalizers did not finish within 5 more steps")
+    }))
+
+  it.effect("F6: deadlocked finalizers and uninterruptible roots are Execution errors", () =>
+    Effect.gen(function*() {
+      for (const stuck of [Effect.ensuring(Effect.never, Effect.never), Effect.uninterruptible(Effect.never)]) {
+        const error = yield* Effect.flip(Fuzz.run(Arbitrary.Constant(0), () => Effect.as(stuck, true), {
+          seed: 1,
+          executions: 1,
+          execution: FuzzSimulation.execution()
+        }))
+        assert.strictEqual(error.reason, "Execution")
+        assert.include(error.message, "cleanup deadlocked")
+      }
     }))
 
   it.effect("virtual time keeps sub-millisecond precision", () =>

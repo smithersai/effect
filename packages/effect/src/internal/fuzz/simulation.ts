@@ -149,7 +149,8 @@ export class World {
 
   /**
    * Interrupts a stuck or limited root and runs its finalizers inside the world with a fresh budget of `steps`. Returns
-   * `"Limited"` when finalizers were still running at the end of that budget.
+   * `"Limited"` when finalizers were still running at the end of that budget, or `"Deadlock"` when the interrupted
+   * root remains suspended with no runnable work or timers.
    */
   release(fiber: Fiber.Fiber<unknown, unknown>, steps: number): Outcome {
     fiber.interruptUnsafe()
@@ -190,12 +191,17 @@ export const execution = (options?: {
             }
             // Release what the stuck program holds, so its finalizers run inside the world. A finalizer that is still
             // running when the budget ends would be abandoned half done: that is a driver failure, not a finding.
-            if (world.release(fiber, maxSteps) === "Limited") {
+            const cleanup = world.release(fiber, maxSteps)
+            if (cleanup !== "Completed") {
               return Effect.die(
                 new Error(
                   `the simulation interrupted a ${
                     outcome === "Deadlock" ? "deadlocked" : "step-limited"
-                  } evaluation, but its finalizers did not finish within ${maxSteps} more steps; raise maxSteps`
+                  } evaluation, but ${
+                    cleanup === "Deadlock"
+                      ? "cleanup deadlocked: a finalizer or uninterruptible root remains suspended"
+                      : `its finalizers did not finish within ${maxSteps} more steps; raise maxSteps`
+                  }`
                 )
               )
             }

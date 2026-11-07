@@ -162,6 +162,24 @@ describe("fuzz runner", () => {
     }))
 })
 
+describe("fuzz exhausted sessions", () => {
+  it.effect("an all-discarded session fails instead of reporting a passing test", () =>
+    Effect.gen(function*() {
+      const target = Fuzz.target(Arbitrary.filter(Arbitrary.schema(Small), () => false), () => true, {
+        id: "exhausted",
+        revision: "1"
+      })
+      const error = yield* Effect.flip(InternalFuzz.runFuzz(
+        target,
+        Fuzz.memoryCorpus(),
+        undefined,
+        { executions: 10 },
+        () => Effect.void
+      ))
+      assert.include(error.message, "all 10 executions were discarded")
+    }))
+})
+
 describe("fuzz registration", () => {
   const calls = { effect: 0, effectVoid: 0, sync: 0, syncVoid: 0, simulated: 0 }
   it.effect.fuzz("an Effect fuzz test with no saved failures passes", [Small], ([n]) =>
