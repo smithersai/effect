@@ -285,6 +285,12 @@ export * as Formatter from "./Formatter.ts"
 export * as Function from "./Function.ts"
 
 /**
+ * @stability unstable
+ * @since 4.0.0
+ */
+export * as Fuzz from "./Fuzz.ts"
+
+/**
  * @stability experimental
  * @since 4.0.0
  */
