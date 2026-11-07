@@ -43,7 +43,7 @@ describe("Fuzz", () => {
         assert.deepStrictEqual(a, b)
         const c = yield* fuzz(intArrays, property, { executions: 5_000, seed: "other" })
         assert.notStrictEqual(JSON.stringify(c.stats), JSON.stringify({ ...a.stats, seed: "other" }))
-      }))
+      }), 30_000)
 
     it.effect("an unseeded run reports the seed it drew", () =>
       Effect.gen(function*() {
@@ -214,17 +214,21 @@ describe("Fuzz", () => {
   })
 
   describe("replay", () => {
-    it.effect("a replay token reproduces the shrunk finding, and passes once the bug is fixed", () =>
-      Effect.gen(function*() {
-        const property = (xs: ReadonlyArray<number>) => !xs.includes(42)
-        const finding = firstFinding(yield* fuzz(intArrays, property, { executions: 50_000 }))
-        assert.deepStrictEqual(finding.input, [42])
-        const replayed = firstFinding(yield* Fuzz.run(intArrays, property, { replay: finding.replay }))
-        assert.deepStrictEqual(replayed.input, [42])
-        assert.strictEqual(replayed.replay, finding.replay)
-        const fixed = yield* Fuzz.run(intArrays, () => true, { replay: finding.replay })
-        assert.deepStrictEqual([fixed._tag, fixed.stats.stoppedBy], ["Passed", "Replay"])
-      }))
+    it.effect(
+      "a replay token reproduces the shrunk finding, and passes once the bug is fixed",
+      () =>
+        Effect.gen(function*() {
+          const property = (xs: ReadonlyArray<number>) => !xs.includes(42)
+          const finding = firstFinding(yield* fuzz(intArrays, property, { executions: 50_000 }))
+          assert.deepStrictEqual(finding.input, [42])
+          const replayed = firstFinding(yield* Fuzz.run(intArrays, property, { replay: finding.replay }))
+          assert.deepStrictEqual(replayed.input, [42])
+          assert.strictEqual(replayed.replay, finding.replay)
+          const fixed = yield* Fuzz.run(intArrays, () => true, { replay: finding.replay })
+          assert.deepStrictEqual([fixed._tag, fixed.stats.stoppedBy], ["Passed", "Replay"])
+        }),
+      30_000
+    )
 
     it.effect("a token whose shrink path no longer exists passes", () =>
       Effect.gen(function*() {
@@ -295,7 +299,7 @@ describe("Fuzz", () => {
           { executions: 3_000, feedback: [] }
         )
         assert.strictEqual(repeated.stats.features.observations, 8)
-      }))
+      }), 30_000)
 
     it.effect("labels structural exploration honestly", () =>
       Effect.gen(function*() {

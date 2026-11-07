@@ -452,6 +452,10 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
   // Executions that produced each (feature, bucket) pair. An entry's energy is the rarity of the rarest pair it owns,
   // following AFL++'s "fast" power schedule, so the search keeps working on the frontier.
   const pairHits = new Map<number, number>()
+  // Pairs from sources that measure progress through the program (spans, observations, injected providers). When there
+  // are any, only they give energy: structural and cause pairs keep adding diverse entries, but a rarely seen size
+  // bucket must not starve the entry at the frontier of the program.
+  const guided = new Set<number>()
   const best = new Map<string, number>()
   const owners = new Map<number, number>()
   // The best entry for each score label. Champions get the highest energy, so a score is climbed, not just recorded.
@@ -505,6 +509,7 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       if (hits === undefined) {
         const source = measured.sources.get(id)!
         features[source] = (features[source] ?? 0) + 1
+        if (source !== "structural" && source !== "causes") guided.add(pair)
         interesting = true
       }
     }
@@ -710,7 +715,9 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       total += 1 - (energy.get(champion) ?? 0)
       energy.set(champion, 1)
     }
+    const guiding = guided.size > 0
     for (const [pair, owner] of owners) {
+      if (guiding && !guided.has(pair)) continue
       const rarity = 1 / pairHits.get(pair)!
       const previous = energy.get(owner) ?? 0
       if (rarity > previous) {

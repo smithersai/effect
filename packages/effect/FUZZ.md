@@ -19,8 +19,9 @@ behind conditions that random inputs almost never satisfy together: a magic numb
 after a precise sequence of commands, or a fiber interleaving.
 
 The test suite in `test/fuzz/Fuzz.benchmark.test.ts` has a parser with a four-byte magic number. `checkEffect` passes
-it after 100,000 runs with seed 1; `Fuzz.run` with seed 1 finds the crash at execution 197,163, guided only by the
-`Effect.fn` spans the parser already has.
+it after 100,000 runs (seeds 1, 2 and 3). `Fuzz.run` finds the crash with each of seeds 1 to 8, in 47,749 to 701,387
+executions (median about 92,000), guided only by the `Effect.fn` spans the parser already has. Without span feedback
+(`feedback: []`) it finds nothing in 1,000,000 executions.
 
 ## A first run
 
@@ -137,6 +138,33 @@ in `packages/vitest/test/fuzz-example.test.ts` is this workflow, with its saved 
 `it.fuzz` is the synchronous form. Options: `id` (default: the test's full name), `revision` (default `"1"`), `fuzz`
 (search options for sessions), and the usual Vitest options.
 
+## Fuzzing interleavings
+
+`FuzzSimulation.execution()` from `effect/testing` makes fiber scheduling part of the input:
+
+```ts
+import { FuzzSimulation } from "effect/testing"
+
+Fuzz.run(amounts, conservesMoney, { execution: FuzzSimulation.execution(), executions: 10_000 })
+```
+
+Each execution runs in a fresh closed world. Queued tasks keep the scheduler's documented order (priority, then FIFO);
+a second tape decides how many run-loop operations each fiber slice may take before the runtime preempts it. Word 0
+means the ordinary slice, so shrinking a schedule zeroes words until the failing interleaving is as cooperative as it
+can be. `Effect.sleep`, `Clock` and timeouts run on a virtual clock that jumps to the next timer when nothing is
+runnable. A program with nothing runnable, no pending timer and an unfinished property is a `Deadlock` finding.
+
+`test/fuzz/FuzzSimulation.test.ts` has two withdrawals that read a balance, check it, and write it back. `checkEffect`
+passes 10,000 runs: the default scheduler runs each withdrawal to completion. Under the simulation, `Fuzz.run` finds the
+lost update at execution 5 and shrinks it to amounts `[1, 1]` with one nonzero schedule word. Its replay token gives
+the same interleaving 1,000 times out of 1,000:
+
+```
+A reads balance 100 | B reads balance 100 | B writes balance 99, pays 1 | A writes balance 99, pays 1
+```
+
+The world is closed: real I/O, native timers, `Date.now`, `Math.random` and promises from outside Effect escape it.
+
 ## Determinism and its limits
 
 For a seed, execution `k` is the same on every machine: the fuzzer's own random source chooses inputs and mutations,
@@ -153,7 +181,10 @@ shared mutable state breaks this, exactly as it breaks `checkEffect` replay.
 - **No second generator model.** Every Arbitrary is fuzzable unchanged, including `map`, `filter`, `filterMap`,
   `flatMap`, recursion and records. A test pins that the same tape gives the same value with and without shrink trees.
 - **Energy follows rarity.** A parent is chosen by the rarity of the rarest feature it owns (AFL++'s "fast" schedule);
-  the best entry for each score has top energy. One in four parents is uniform, one in eight inputs is fresh.
+  the best entry for each score has top energy. When spans, observations or an injected provider produced features,
+  only theirs give energy: structural features keep adding diverse inputs, but must not starve the entry at the
+  frontier of the program (this took the benchmark from 2 of 5 seeds to 8 of 8). One in four parents is uniform, one in
+  eight inputs is fresh.
 - **Infrastructure errors are not findings.** A dying generator, feedback source, store, codec or execution driver is a
   `FuzzError`.
 - **`checkEffect` is untouched.** `Fuzz` lives in its own module with its own evaluation and shrink walk, so ordinary

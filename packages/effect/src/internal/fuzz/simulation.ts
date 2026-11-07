@@ -1,0 +1,161 @@
+import * as Clock from "../../Clock.ts"
+import * as Context from "../../Context.ts"
+import * as Duration from "../../Duration.ts"
+import * as Effect from "../../Effect.ts"
+import type * as Exit from "../../Exit.ts"
+import type * as Fiber from "../../Fiber.ts"
+import type * as Fuzz from "../../Fuzz.ts"
+import * as Scheduler from "../../Scheduler.ts"
+
+interface Timer {
+  readonly deadline: number
+  readonly sequence: number
+  readonly wake: () => void
+}
+
+/** @internal */
+export type Outcome = "Completed" | "Deadlock" | "Limited"
+
+/**
+ * One closed world: a scheduler whose dispatchers share a single priority/FIFO queue, a virtual clock, and preemption
+ * points read from the schedule tape.
+ *
+ * Queued tasks always run in the documented order (lower priority first, FIFO within a priority). The schedule tape
+ * chooses only how many operations each fiber slice may run before the runtime yields it: word 0 is the ceiling, so
+ * a zero tape is ordinary cooperative scheduling. Reordering queued tasks would break the dispatcher contract and
+ * report races that cannot happen.
+ *
+ * @internal
+ */
+export class World {
+  readonly buckets: Array<[priority: number, tasks: Array<() => void>]> = []
+  readonly timers: Array<Timer> = []
+  readonly slices = new WeakMap<Fiber.Fiber<unknown, unknown>, number>()
+  readonly schedule: Fuzz.ScheduleTape
+  readonly quanta: ReadonlyArray<number>
+  now = 0
+  sequence = 0
+  steps = 0
+  limit: number
+
+  constructor(schedule: Fuzz.ScheduleTape, maxSteps: number, ceiling: number) {
+    this.schedule = schedule
+    // Resuming after a preemption costs two run-loop operations (the resumed exit and its continuation), so a slice
+    // shorter than three operations would preempt the fiber again before it does any work.
+    this.quanta = [ceiling, 3, 4, 5, 6, 8, 12, 16, 32]
+    this.limit = maxSteps
+  }
+
+  readonly scheduler: Scheduler.Scheduler = {
+    executionMode: "sync",
+    shouldYield: (fiber) => {
+      // The run loop resets the operation count at the start of every slice, so a count of one is a new slice.
+      if (fiber.currentOpCount === 1) {
+        const word = this.schedule.next()
+        const index = word === 0 ? 0 : 1 + Math.floor(word / 0x100000000 * (this.quanta.length - 1))
+        this.slices.set(fiber, this.quanta[index])
+      }
+      return fiber.currentOpCount >= this.slices.get(fiber)!
+    },
+    makeDispatcher: () => ({
+      scheduleTask: (task, priority) => this.enqueue(task, priority),
+      flush: () => {
+        let task = this.dequeue()
+        while (task !== undefined) {
+          task()
+          task = this.dequeue()
+        }
+      }
+    })
+  }
+
+  readonly clock: Clock.Clock = {
+    currentTimeMillisUnsafe: () => this.now,
+    currentTimeMillis: Effect.sync(() => this.now),
+    currentTimeNanosUnsafe: () => BigInt(this.now) * BigInt(1_000_000),
+    currentTimeNanos: Effect.sync(() => BigInt(this.now) * BigInt(1_000_000)),
+    monotonicTimeNanosUnsafe: () => BigInt(this.now) * BigInt(1_000_000),
+    monotonicTimeNanos: Effect.sync(() => BigInt(this.now) * BigInt(1_000_000)),
+    sleep: (duration) =>
+      Effect.callback<void>((resume) => {
+        const millis = Duration.toMillis(duration)
+        // An infinite sleep never wakes; with nothing else to run it is a deadlock.
+        if (millis === Infinity) return
+        const timer: Timer = { deadline: this.now + millis, sequence: this.sequence++, wake: () => resume(Effect.void) }
+        let index = this.timers.length
+        while (index > 0 && this.timers[index - 1].deadline > timer.deadline) index--
+        this.timers.splice(index, 0, timer)
+        // An interrupted sleep withdraws its timer. A woken timer has already left the list.
+        return Effect.sync(() => {
+          this.timers.splice(0, this.timers.length, ...this.timers.filter((other) => other !== timer))
+        })
+      })
+  }
+
+  enqueue(task: () => void, priority: number): void {
+    let index = 0
+    while (index < this.buckets.length && this.buckets[index][0] < priority) index++
+    const bucket = this.buckets[index]
+    if (bucket !== undefined && bucket[0] === priority) bucket[1].push(task)
+    else this.buckets.splice(index, 0, [priority, [task]])
+  }
+
+  dequeue(): (() => void) | undefined {
+    const bucket = this.buckets[0]
+    if (bucket === undefined) return undefined
+    const task = bucket[1].shift()!
+    if (bucket[1].length === 0) this.buckets.shift()
+    return task
+  }
+
+  /**
+   * Runs queued tasks until the fiber exits. When no task is queued, virtual time jumps to the earliest timer and wakes
+   * every timer due then, in registration order.
+   */
+  run(fiber: Fiber.Fiber<unknown, unknown>): Outcome {
+    while (fiber.pollUnsafe() === undefined) {
+      const task = this.dequeue()
+      if (task !== undefined) {
+        if (++this.steps > this.limit) return "Limited"
+        task()
+        continue
+      }
+      const first = this.timers[0]
+      if (first === undefined) return "Deadlock"
+      this.now = first.deadline
+      while (this.timers.length > 0 && this.timers[0].deadline === this.now) this.timers.shift()!.wake()
+    }
+    return "Completed"
+  }
+}
+
+/** @internal */
+export const execution = (options?: {
+  readonly maxSteps?: number | undefined
+  readonly maxOpsBeforeYield?: number | undefined
+}): Fuzz.Execution => {
+  const maxSteps = options?.maxSteps ?? 100_000
+  const ceiling = options?.maxOpsBeforeYield ?? 2048
+  return {
+    name: "simulation",
+    run: (self, schedule) =>
+      Effect.withFiber((parent) => {
+        const world = new World(schedule, maxSteps, ceiling)
+        const context = Context.add(
+          Context.add(Context.add(parent.context, Scheduler.Scheduler, world.scheduler), Clock.Clock, world.clock),
+          Scheduler.PreventSchedulerYield,
+          false
+        )
+        const fiber = Effect.runForkWith(context)(self as Effect.Effect<Exit.Exit<unknown, unknown>>)
+        const outcome = world.run(fiber)
+        if (outcome === "Completed") {
+          return Effect.map(fiber.pollUnsafe()!, (exit): Fuzz.ExecutionResult => ({ _tag: "Completed", exit }))
+        }
+        // Release what the stuck program holds, with a fresh step budget, so its finalizers run inside the world.
+        fiber.interruptUnsafe()
+        world.limit = world.steps + maxSteps
+        world.run(fiber)
+        return Effect.succeed<Fuzz.ExecutionResult>({ _tag: outcome })
+      })
+  }
+}
