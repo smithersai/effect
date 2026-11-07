@@ -7,6 +7,7 @@
 import type * as Arbitrary from "effect/Arbitrary"
 import type * as Duration from "effect/Duration"
 import type * as Effect from "effect/Effect"
+import type * as Fuzz from "effect/Fuzz"
 import type * as Layer from "effect/Layer"
 import type * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
@@ -73,6 +74,23 @@ export declare namespace Vitest {
     : never
 
   /**
+   * Configures a fuzz test registered with `it.fuzz` or `it.effect.fuzz`.
+   *
+   * **Details**
+   *
+   * `id` names the corpus directory, default the test's full name. `revision`, default `"1"`, declares generator
+   * compatibility: change it when the inputs change shape, and saved tapes stop being replayed. Saved values, which
+   * every all-Schema input gets, survive any revision. `fuzz` configures the search in a fuzz session.
+   *
+   * @since 4.0.0
+   */
+  export interface FuzzOptions extends V.TestOptions {
+    readonly id?: string | undefined
+    readonly revision?: string | undefined
+    readonly fuzz?: Fuzz.Options | undefined
+  }
+
+  /**
    * Effect test registration API with modifiers and property testing.
    *
    * @since 4.0.0
@@ -129,6 +147,40 @@ export declare namespace Vitest {
           arbitrary?: Arbitrary.CheckOptions
         }
     ) => void
+
+    /**
+     * Registers an Effectful fuzz test using Schema or Arbitrary inputs.
+     *
+     * **Details**
+     *
+     * A plain `vitest run` replays every failure saved for this test, which must now pass, then checks fresh random
+     * inputs like `prop`. It writes nothing. A fuzz session searches with `Fuzz.runTarget` and saves what it finds.
+     * Start one with `EFFECT_FUZZ=<part of the test name>`, or `EFFECT_FUZZ=1` for every fuzz test, plus
+     * `EFFECT_FUZZ_DURATION`, `EFFECT_FUZZ_EXECUTIONS` and `EFFECT_FUZZ_SEED`. A session raises the test timeout to the
+     * duration plus 30 seconds.
+     *
+     * Failures are saved beside the test file in `__fuzz__/<file name>/<id>`, to commit. Search inputs are
+     * cached in `node_modules/.cache/effect-fuzz`. Returning `false`, failing, or dying is a finding; interruption
+     * interrupts the test.
+     *
+     * @since 4.0.0
+     */
+    fuzz: <const Arbs extends Arbitraries, A, E>(
+      name: string,
+      arbitraries: Arbs,
+      self: TestFunction<
+        A,
+        E,
+        R,
+        [
+          {
+            [K in keyof Arbs]: ArbitraryValue<Arbs[K]>
+          },
+          V.TestContext
+        ]
+      >,
+      options?: FuzzOptions
+    ) => void
   }
 
   /**
@@ -184,6 +236,28 @@ export declare namespace Vitest {
         | V.TestOptions & {
           arbitrary?: Arbitrary.CheckOptions
         }
+    ) => void
+
+    /**
+     * Registers a synchronous fuzz test using Schema or Arbitrary inputs.
+     *
+     * **Details**
+     *
+     * Behaves like `it.effect.fuzz` for a callback that returns `boolean` or `void`. Returning `false` or throwing is
+     * a finding.
+     *
+     * @since 4.0.0
+     */
+    readonly fuzz: <const Arbs extends Arbitraries>(
+      name: string,
+      arbitraries: Arbs,
+      self: (
+        properties: {
+          [K in keyof Arbs]: ArbitraryValue<Arbs[K]>
+        },
+        ctx: V.TestContext
+      ) => boolean | void,
+      options?: FuzzOptions
     ) => void
   }
 
@@ -394,6 +468,15 @@ export const flakyTest: <A, E, R>(
  * @since 4.0.0
  */
 export const prop: Vitest.Methods["prop"] = internal.prop
+
+/**
+ * Runs a synchronous fuzz test using schemas or arbitraries.
+ *
+ * @stability unstable
+ * @category testing
+ * @since 4.0.0
+ */
+export const fuzz: Vitest.Methods["fuzz"] = internal.fuzz
 
 /**
  * Vitest test API extended with Effect test helpers.

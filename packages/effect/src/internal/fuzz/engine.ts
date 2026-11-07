@@ -5,6 +5,7 @@ import * as Data from "../../Data.ts"
 import * as Duration from "../../Duration.ts"
 import * as Effect from "../../Effect.ts"
 import * as Exit from "../../Exit.ts"
+import * as Formatter from "../../Formatter.ts"
 import type * as Fuzz from "../../Fuzz.ts"
 import * as Option from "../../Option.ts"
 import * as Random from "../../Random.ts"
@@ -485,7 +486,7 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
           path,
           codec: codec?.id,
           value: encoded,
-          note: `${signature}\n${JSON.stringify(encoded ?? null)}`
+          note: `${signature}\n${encoded ?? Formatter.format(value)}`
         })
       ))
 

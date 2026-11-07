@@ -1,0 +1,16 @@
+effect-fuzz 1
+kind failure
+revision 1
+size 4
+bias 3
+null-prototype true
+key 956589429
+tape 0vkisrp9ldRZtLT7Addaf1m0tPtbw0hFMTpuePJ_PUZzikOUJZyOsA
+schedule-key 1419443264
+schedule 
+signature Died:RangeError
+path 29
+codec json
+value [[127,69,70,0]]
+# Died:RangeError
+# "[[127,69,70,0]]"

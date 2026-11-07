@@ -17,6 +17,7 @@ import * as TestClock from "effect/testing/TestClock"
 import * as TestConsole from "effect/testing/TestConsole"
 import * as V from "vitest"
 import type * as Vitest from "../index.ts"
+import * as InternalFuzz from "./fuzz.ts"
 
 const getCurrentSuite = V.TestRunner.getCurrentSuite
 
@@ -118,21 +119,25 @@ const normalizeProperty = <A, E, R>(
       Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.fail(cause)
   )
 
+const checkProperty = <A, E>(
+  arbitrary: Arbitrary.Arbitrary<A>,
+  property: (value: A) => boolean | Effect.Effect<boolean, E>,
+  options: Arbitrary.CheckOptions | undefined
+): Effect.Effect<void> =>
+  Effect.flatMapEager(
+    Arbitrary.checkEffect(arbitrary, (value) => normalizeProperty(property, value), options),
+    (result) => {
+      const failure = Arbitrary.formatCheckFailure(result)
+      return failure === undefined ? Effect.void : Effect.die(new Error(failure))
+    }
+  )
+
 const runCheck = <A, E>(
   ctx: V.TestContext,
   arbitrary: Arbitrary.Arbitrary<A>,
   property: (value: A) => boolean | Effect.Effect<boolean, E>,
   options: Arbitrary.CheckOptions | undefined
-): Promise<void> =>
-  runTest(ctx)(
-    Effect.flatMapEager(
-      Arbitrary.checkEffect(arbitrary, (value) => normalizeProperty(property, value), options),
-      (result) => {
-        const failure = Arbitrary.formatCheckFailure(result)
-        return failure === undefined ? Effect.void : Effect.die(new Error(failure))
-      }
-    )
-  )
+): Promise<void> => runTest(ctx)(checkProperty(arbitrary, property, options))
 
 // Vitest decides which fixtures to set up by parsing the source of a test
 // function's context parameter, and there is no public API to supply the names
@@ -255,6 +260,43 @@ const registerProp = <ExtraContext, A>(
   )
 }
 
+const registerFuzz = <ExtraContext, A>(
+  it: V.TestAPI<ExtraContext>,
+  name: string,
+  arbitraries: Arbitraries,
+  property: (values: A, ctx: V.TestContext) => boolean | Effect.Effect<boolean, unknown>,
+  options: Vitest.Vitest.FuzzOptions | undefined
+) => {
+  const { fuzz, id, revision, ...vitestOptions } = options ?? {}
+  // The session switch is read once, when the test is registered, so it can also raise the test timeout.
+  const session = InternalFuzz.session(process.env, name)
+  const timeout = session === undefined || vitestOptions.timeout !== undefined
+    ? vitestOptions
+    : { ...vitestOptions, timeout: InternalFuzz.sessionTimeout({ ...fuzz, ...session }) }
+  it(
+    name,
+    timeout,
+    withFixturesOf(
+      () => {},
+      (ctx: V.TestContext) => {
+        const values = (values: A) => property(values, ctx)
+        const target = InternalFuzz.makeTarget(arbitraries, values, {
+          id: id ?? ctx.task.fullTestName ?? ctx.task.name,
+          revision: revision ?? "1"
+        })
+        const store = InternalFuzz.fileCorpus(InternalFuzz.corpusDirectories(ctx.task.file.filepath, process.cwd()))
+        const fuzzed = InternalFuzz.runFuzz(target, store, fuzz, session, (message) => Effect.logInfo(message))
+        // A plain run replays saved failures, then checks fresh random inputs like `it.prop`.
+        return runTest(ctx)(
+          session === undefined
+            ? Effect.andThen(fuzzed, checkProperty(makeArbitrary(arbitraries), values, undefined))
+            : fuzzed
+        )
+      }
+    )
+  )
+}
+
 const makeTester = <R, ExtraContext>(
   mapEffect: <A, E>(self: Effect.Effect<A, E, R>) => Effect.Effect<A, E, never>,
   it: V.TestAPI<ExtraContext>
@@ -290,6 +332,19 @@ const makeTester = <R, ExtraContext>(
       timeout
     )
 
+  const fuzz: Vitest.Vitest.Tester<R, ExtraContext>["fuzz"] = (name, arbitraries, self, options) =>
+    registerFuzz(
+      it,
+      name,
+      arbitraries,
+      (values, ctx) =>
+        Effect.mapEager(
+          mapEffect(Effect.suspend(() => self(values as any, ctx))),
+          (value) => (value as unknown) !== false
+        ),
+      options
+    )
+
   return Object.assign(register(it), {
     skip: register(it.skip),
     skipIf: (condition: unknown) => register(it.skipIf(condition)),
@@ -297,7 +352,8 @@ const makeTester = <R, ExtraContext>(
     only: register(it.only),
     each,
     fails: register(it.fails),
-    prop
+    prop,
+    fuzz
   })
 }
 
@@ -310,6 +366,16 @@ const makeProp =
       }
       return result !== false
     }, timeout)
+
+const makeFuzz =
+  <ExtraContext>(it: V.TestAPI<ExtraContext>): Vitest.Vitest.Methods["fuzz"] => (name, arbitraries, self, options) =>
+    registerFuzz(it, name, arbitraries, (values, ctx) => {
+      const result = self(values as any, ctx)
+      if (result !== undefined && typeof result !== "boolean") {
+        throw new TypeError("it.fuzz callbacks must return boolean or void. Use it.effect.fuzz for Effect callbacks.")
+      }
+      return result !== false
+    }, options)
 
 const makeLayer = <ExtraContext>(it: V.TestAPI<ExtraContext>) =>
 <R, E>(
@@ -352,6 +418,7 @@ const makeLayer = <ExtraContext>(it: V.TestAPI<ExtraContext>) =>
     makeItProxy(it, {
       effect: makeTester<R | Scope.Scope, ExtraContext>((effect) => provide(Effect.scoped(effect)), it),
       prop: makeProp<ExtraContext>(it),
+      fuzz: makeFuzz<ExtraContext>(it),
       flakyTest,
       layer<R2, E2>(nestedLayer: Layer.Layer<R2, E2, R>, nestedOptions?: {
         readonly concurrent?: boolean
@@ -491,7 +558,8 @@ export const makeMethods = <ExtraContext>(it: V.TestAPI<ExtraContext>): Vitest.V
     live: makeTester<Scope.Scope, ExtraContext>(Effect.scoped, it),
     flakyTest,
     layer: makeLayer<ExtraContext>(it),
-    prop: makeProp<ExtraContext>(it)
+    prop: makeProp<ExtraContext>(it),
+    fuzz: makeFuzz<ExtraContext>(it)
   })
 
 /** @internal */
@@ -506,7 +574,9 @@ export const {
   /** @internal */
   live,
   /** @internal */
-  prop
+  prop,
+  /** @internal */
+  fuzz
 } = it
 
 /** @internal */
