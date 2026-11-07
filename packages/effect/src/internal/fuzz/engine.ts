@@ -606,9 +606,13 @@ export const runTarget = Effect.fnUntraced(function*<A, E, R>(
       replay,
       ...persistence
     }
-    if (recheck === undefined) findings.set(signature, found)
-    else if (!flaky.has(signature)) flaky.set(signature, { ...found, recheck })
-    sinceProgress = 0
+    if (recheck === undefined) {
+      findings.set(signature, found)
+      sinceProgress = 0
+    } else if (!flaky.has(signature)) {
+      flaky.set(signature, { ...found, recheck })
+      sinceProgress = 0
+    }
   }
 
   const onFailure = Effect.fnUntraced(function*(input: Format.Input, failure: Fuzz.Failure<E>) {

@@ -56,6 +56,21 @@ describe("Fuzz Fable regressions", () => {
       assert.strictEqual(calls, 4)
     }))
 
+  it.effect("repeated flaky candidates do not reset the plateau budget", () =>
+    Effect.gen(function*() {
+      let calls = 0
+      const report = yield* Fuzz.run(Arbitrary.Constant(0), () => ++calls % 2 === 0, {
+        seed: 1,
+        size: 0,
+        executions: 1_000,
+        plateau: 10,
+        feedback: []
+      })
+      assert.strictEqual(report._tag, "Flaky")
+      assert.strictEqual(report.stats.stoppedBy, "Plateau")
+      assert.isBelow(report.stats.executions, 1_000)
+    }))
+
   for (const values of [true, false]) {
     it.effect(`F3: a later ${values ? "value" : "tape"} failure retains a fixed regression of the same signature`, () =>
       Effect.gen(function*() {
