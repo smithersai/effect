@@ -72,6 +72,7 @@ This import enhances the standard `it` function from `vitest` with several power
 | `it.live`      | Runs a scoped test with the live Effect environment.                                                |
 | `it.layer`     | Shares a `Layer` between multiple tests, or builds it for each test with `buildPerTest: true`.      |
 | `it.prop`      | Runs property tests using Effect `Schema` and `Arbitrary` values.                                   |
+| `it.fuzz`      | Replays saved fuzz failures, or runs a `Fuzz` search when `EFFECT_FUZZ` selects the test.           |
 | `it.flakyTest` | Retries an Effect that might occasionally fail until it succeeds or reaches the configured timeout. |
 
 Pass `{ buildPerTest: true }` to `it.layer` to build its layer once per test instead of once per block. Each test gets new services, released when it finishes, while services from an enclosing `layer` block stay shared. Blocks nested inside a per-test block are built per test as well.
@@ -391,3 +392,28 @@ To handle this flakiness, we use `it.flakyTest` to retry the test until it passe
 // Retrying the flaky test with a 5-second timeout
 it.effect("retrying until success or timeout", () => it.flakyTest(flaky, "5 seconds"))
 ```
+
+## Fuzzing with `it.effect.fuzz`
+
+`it.effect.fuzz` and `it.fuzz` take the same inputs as `it.effect.prop` and `it.prop`. A plain `vitest run` replays
+every failure saved for the test, which must now pass, then checks random inputs like a property test. It writes
+nothing.
+
+```ts
+import { it } from "@effect/vitest"
+import { Effect, Schema } from "effect"
+
+const Byte = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 255 }))
+
+it.effect.fuzz("parse never dies", [Schema.Array(Byte)], ([bytes]) => parse(bytes).pipe(Effect.as(true)))
+```
+
+A fuzz session searches with `Fuzz.runTarget` and saves each finding beside the test file, in
+`__fuzz__/<test file>/<test name>/`. Commit that directory; the next plain run replays it.
+
+```sh
+EFFECT_FUZZ="parse never dies" EFFECT_FUZZ_DURATION="60 seconds" EFFECT_FUZZ_SEED=1 vitest run
+```
+
+`EFFECT_FUZZ=1` selects every fuzz test; `EFFECT_FUZZ_EXECUTIONS` bounds a session by executions. Returning `false`,
+failing, or dying is a finding. See `FUZZ.md` in the `effect` package for feedback, corpus and schedule fuzzing.
