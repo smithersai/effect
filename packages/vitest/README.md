@@ -409,11 +409,13 @@ it.effect.fuzz("parse never dies", [Schema.Array(Byte)], ([bytes]) => parse(byte
 ```
 
 A fuzz session searches with `Fuzz.runTarget` and saves each finding beside the test file, in
-`__fuzz__/<test file>/<test name>/`. Commit that directory; the next plain run replays it.
+`__fuzz__/<test file>/<test name>-<hash>/`. Commit that directory; the next plain run replays it.
 
 ```sh
 EFFECT_FUZZ="parse never dies" EFFECT_FUZZ_DURATION="60 seconds" EFFECT_FUZZ_SEED=1 vitest run
 ```
 
 `EFFECT_FUZZ=1` selects every fuzz test; `EFFECT_FUZZ_EXECUTIONS` bounds a session by executions. Returning `false`,
-failing, or dying is a finding. See `FUZZ.md` in the `effect` package for feedback, corpus and schedule fuzzing.
+failing, or dying is a finding. With `fuzz: { execution: FuzzSimulation.execution() }`, plain runs replay under the simulation too, and
+`it.effect.fuzz` lets the simulation own `Clock` and `Scheduler` instead of `TestClock`. See `FUZZ.md` in the `effect`
+package for feedback, corpus and schedule fuzzing.

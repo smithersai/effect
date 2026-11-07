@@ -129,14 +129,21 @@ EFFECT_FUZZ="parse never dies" EFFECT_FUZZ_DURATION="60 seconds" EFFECT_FUZZ_SEE
 `EFFECT_FUZZ` selects tests whose name contains it, or every fuzz test when it is `1`. `EFFECT_FUZZ_EXECUTIONS` bounds
 the session by executions instead. A session raises the test timeout to the duration plus 30 seconds. A finding fails
 the test with the shrunk input, the signature and the replay token, and is saved to
-`__fuzz__/<test file>/<test name>/<key>` beside the test file: commit that directory. Search inputs go to
-`node_modules/.cache/effect-fuzz`.
+`__fuzz__/<test file>/<test name>-<hash>/<key>` beside the test file: commit that directory. The directory name is the
+test name with punctuation replaced by `-`, then 16 hex digits of a SHA-256 of the full id, so `parse: x` and `parse x`
+never share a corpus. Search inputs go to `node_modules/.cache/effect-fuzz`.
 
 After the fix, the plain run prints `Replayed 1 saved failure(s) of Container > parse never dies` and passes. The test
 in `packages/vitest/test/fuzz-example.test.ts` is this workflow, with its saved failure committed.
 
 `it.fuzz` is the synchronous form. Options: `id` (default: the test's full name), `revision` (default `"1"`), `fuzz`
 (search options for sessions), and the usual Vitest options.
+
+`fuzz.execution` also applies to plain runs: saved failures replay under the same driver, and the random check runs
+100 executions under it instead of `checkEffect`. Under `it.effect.fuzz`, the driver owns `Clock` and `Scheduler` for
+each evaluation; the other test services (`TestConsole`, the scope) are still provided. So with
+`fuzz: { execution: FuzzSimulation.execution() }`, `Effect.sleep` and `Effect.timeout` run in virtual time, not on the
+`TestClock`.
 
 ## Fuzzing interleavings
 

@@ -3,6 +3,7 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fuzz from "effect/Fuzz"
 import * as Schema from "effect/Schema"
+import * as crypto from "node:crypto"
 import * as fs from "node:fs"
 import * as path from "node:path"
 
@@ -44,11 +45,20 @@ export const sessionTimeout = (options: Fuzz.Options): number =>
     ? 0
     : Duration.toMillis(Duration.fromInputUnsafe(options.duration ?? "10 seconds")) + 30_000
 
-const segment = (id: string) => id.replace(/[^A-Za-z0-9._-]+/g, "-")
+/**
+ * The directory name of a target: a readable prefix of its id, then a hash of the whole id. The prefix alone merges
+ * ids such as "parse: x" and "parse x", and could be "", "." or "..".
+ *
+ * @internal
+ */
+export const segment = (id: string): string =>
+  `${id.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 64)}-${
+    crypto.createHash("sha256").update(id).digest("hex").slice(0, 16)
+  }`
 
 /**
- * A corpus store over `node:fs`. Failures go to `failures/<id>/<key>`, the directory to commit; inputs go to
- * `inputs/<id>/<key>`, a cache. Files are written to a temporary name and renamed, so a crash never leaves half an
+ * A corpus store over `node:fs`. Failures go to `failures/<segment>/<key>`, the directory to commit; inputs go to
+ * `inputs/<segment>/<key>`, a cache, where the segment is {@link segment} of the target id. Files are written to a temporary name and renamed, so a crash never leaves half an
  * entry.
  *
  * @internal
@@ -138,7 +148,13 @@ export const runFuzz = <A, E, R>(
   log: (message: string) => Effect.Effect<void>
 ): Effect.Effect<void, Fuzz.FuzzError | Error, R> =>
   Effect.flatMap(
-    Fuzz.runTarget(target, sessionOptions === undefined ? { executions: 0 } : { ...options, ...sessionOptions }).pipe(
+    // A plain run replays only, but under the same execution driver: a saved schedule race needs the simulation.
+    Fuzz.runTarget(
+      target,
+      sessionOptions === undefined
+        ? { executions: 0, execution: options?.execution }
+        : { ...options, ...sessionOptions }
+    ).pipe(
       Effect.provideService(Fuzz.Corpus, store)
     ),
     (report) => {

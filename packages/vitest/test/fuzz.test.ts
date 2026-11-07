@@ -1,9 +1,12 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as InternalFuzz from "@effect/vitest/internal/fuzz"
-import { Arbitrary, Effect, Fuzz, Schema } from "effect"
+import { makeMethods } from "@effect/vitest/internal/internal"
+import { Arbitrary, Clock, Effect, Fuzz, Ref, Schema } from "effect"
+import { FuzzSimulation } from "effect/testing"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
+import * as V from "vitest"
 
 const Small = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 1000 }))
 
@@ -54,12 +57,14 @@ describe("fuzz file corpus", () => {
       yield* store.save("a b/c", { kind: "Input", key: "2", text: "input" })
       yield* store.save("a b/c", { kind: "Failure", key: "1", text: "failure" })
       yield* store.save("a b/c", { kind: "Failure", key: "1", text: "shrunk" })
-      fs.writeFileSync(path.join(root, "f", "a-b-c", "0.tmp"), "partial")
+      const [directory] = fs.readdirSync(path.join(root, "f"))
+      fs.writeFileSync(path.join(root, "f", directory, "0.tmp"), "partial")
       assert.deepStrictEqual(yield* store.load("a b/c"), [
         { kind: "Failure", key: "1", text: "shrunk" },
         { kind: "Input", key: "2", text: "input" }
       ])
-      assert.isTrue(fs.existsSync(path.join(root, "f", "a-b-c", "1")))
+      assert.isTrue(fs.existsSync(path.join(root, "f", directory, "1")))
+      assert.match(directory, /^a-b-c-[0-9a-f]{16}$/)
     }))
 
   it.effect("reports file system failures as Corpus errors", () =>
@@ -73,9 +78,13 @@ describe("fuzz file corpus", () => {
         "Corpus",
         true
       ])
-      fs.mkdirSync(path.join(root, "dir"))
-      fs.writeFileSync(path.join(root, "dir", "t"), "")
-      const unreadable = InternalFuzz.fileCorpus({ failures: path.join(root, "dir"), inputs: path.join(root, "dir") })
+      const dir = path.join(root, "dir")
+      const unreadable = InternalFuzz.fileCorpus({ failures: dir, inputs: dir })
+      // Replace the target directory with a file.
+      yield* unreadable.save("t", { kind: "Failure", key: "1", text: "x" })
+      const [target] = fs.readdirSync(dir)
+      fs.rmSync(path.join(dir, target), { recursive: true })
+      fs.writeFileSync(path.join(dir, target), "")
       const loadError = yield* Effect.flip(unreadable.load("t"))
       assert.deepStrictEqual([loadError.reason, loadError.message.includes("cannot read the corpus of t")], [
         "Corpus",
@@ -154,11 +163,93 @@ describe("fuzz runner", () => {
 })
 
 describe("fuzz registration", () => {
-  it.effect.fuzz("an Effect fuzz test with no saved failures passes", [Small], ([n]) => Effect.succeed(n >= 0))
-  it.effect.fuzz("a void Effect fuzz test passes", { n: Small }, ({ n }) => Effect.sync(() => assert.isAtLeast(n, 0)), {
+  const calls = { effect: 0, effectVoid: 0, sync: 0, syncVoid: 0, simulated: 0 }
+  it.effect.fuzz("an Effect fuzz test with no saved failures passes", [Small], ([n]) =>
+    Effect.sync(() => {
+      calls.effect++
+      return n >= 0
+    }))
+  it.effect.fuzz("a void Effect fuzz test passes", { n: Small }, ({ n }) =>
+    Effect.sync(() => {
+      calls.effectVoid++
+      assert.isAtLeast(n, 0)
+    }), {
     id: "named",
     revision: "2"
   })
-  it.fuzz("a synchronous fuzz test passes", [Small], ([n]) => n >= 0)
-  it.fuzz("a void synchronous fuzz test passes", [Arbitrary.schema(Small)], () => {})
+  it.fuzz("a synchronous fuzz test passes", [Small], ([n]) => {
+    calls.sync++
+    return n >= 0
+  })
+  it.fuzz("a void synchronous fuzz test passes", [Arbitrary.schema(Small)], () => {
+    calls.syncVoid++
+  })
+  // The simulation, not TestClock, owns Clock and Scheduler: sleeps and timeouts run in virtual time.
+  it.effect.fuzz(
+    "an Effect fuzz test under the simulation sleeps in virtual time",
+    [Small],
+    () =>
+      Effect.gen(function*() {
+        calls.simulated++
+        yield* Effect.sleep("1 millis")
+        const timedOut = yield* Effect.exit(Effect.timeout(Effect.sleep("1 minute"), "1 second"))
+        return timedOut._tag === "Failure" && (yield* Clock.currentTimeMillis) === 1_001
+      }),
+    { fuzz: { execution: FuzzSimulation.execution() } }
+  )
+  it("ran every registered callback", () => {
+    for (const [name, count] of Object.entries(calls)) assert.isAbove(count, 0, name)
+  })
+})
+
+describe("fuzz registration that must fail", () => {
+  // Registered through `it.fails`: a registration that installed a no-op test would pass and fail this file.
+  const expectFailure = makeMethods(V.it.fails as unknown as V.TestAPI)
+  expectFailure.fuzz("a failing synchronous fuzz test fails", [Small], ([n]) => n < 0)
+  expectFailure.effect.fuzz("a failing Effect fuzz test fails", [Small], ([n]) => Effect.succeed(n < 0))
+  expectFailure.fuzz("an it.fuzz callback returning an Effect fails", [Small], () => Effect.succeed(true) as never)
+})
+
+describe("fuzz corpus directories", () => {
+  it.effect("distinct test ids never share a directory", () =>
+    Effect.gen(function*() {
+      const root = temporary()
+      const failures = path.join(root, "failures")
+      const store = InternalFuzz.fileCorpus({ failures, inputs: path.join(root, "inputs") })
+      const ids = ["parse: x", "parse x", "parse-x", "", ".", ".."]
+      for (const id of ids) yield* store.save(id, { kind: "Failure", key: "k", text: id })
+      for (const id of ids) assert.deepStrictEqual(yield* store.load(id), [{ kind: "Failure", key: "k", text: id }])
+      // Nothing escapes the failures directory.
+      assert.deepStrictEqual(fs.readdirSync(root), ["failures"])
+      assert.strictEqual(fs.readdirSync(failures).length, ids.length)
+    }))
+})
+
+describe("fuzz runner with an execution driver", () => {
+  const Amount = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 }))
+  const conserves = Effect.fnUntraced(function*([a, b]: readonly [number, number]) {
+    const balance = yield* Ref.make(100)
+    const paid = yield* Ref.make(0)
+    const withdraw = Effect.fnUntraced(function*(amount: number) {
+      const current = yield* Ref.get(balance)
+      if (current < amount) return
+      yield* Ref.set(balance, current - amount)
+      yield* Ref.update(paid, (total) => total + amount)
+    })
+    yield* Effect.all([withdraw(a), withdraw(b)], { concurrency: 2 })
+    return (yield* Ref.get(balance)) + (yield* Ref.get(paid)) === 100
+  })
+
+  it.effect("a saved schedule race fails the next plain run", () =>
+    Effect.gen(function*() {
+      const store = Fuzz.memoryCorpus()
+      const target = Fuzz.target(Schema.Tuple([Amount, Amount]), conserves, { id: "race", revision: "1" })
+      const options: Fuzz.Options = { execution: FuzzSimulation.execution() }
+      const found = yield* Effect.flip(
+        InternalFuzz.runFuzz(target, store, options, { seed: 1, executions: 10_000 }, () => Effect.void)
+      )
+      assert.include(found.message, "ReturnedFalse")
+      const replayed = yield* Effect.flip(InternalFuzz.runFuzz(target, store, options, undefined, () => Effect.void))
+      assert.include(replayed.message, "ReturnedFalse")
+    }))
 })

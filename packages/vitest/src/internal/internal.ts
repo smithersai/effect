@@ -4,13 +4,16 @@
 
 import * as Arbitrary from "effect/Arbitrary"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import { constVoid, flow, pipe } from "effect/Function"
+import * as Fuzz from "effect/Fuzz"
 import * as Layer from "effect/Layer"
 import * as Schedule from "effect/Schedule"
+import * as Scheduler from "effect/Scheduler"
 import type * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as TestClock from "effect/testing/TestClock"
@@ -286,12 +289,16 @@ const registerFuzz = <ExtraContext, A>(
         })
         const store = InternalFuzz.fileCorpus(InternalFuzz.corpusDirectories(ctx.task.file.filepath, process.cwd()))
         const fuzzed = InternalFuzz.runFuzz(target, store, fuzz, session, (message) => Effect.logInfo(message))
-        // A plain run replays saved failures, then checks fresh random inputs like `it.prop`.
-        return runTest(ctx)(
-          session === undefined
-            ? Effect.andThen(fuzzed, checkProperty(makeArbitrary(arbitraries), values, undefined))
-            : fuzzed
-        )
+        // A plain run replays saved failures, then checks fresh random inputs like `it.prop`. With an execution
+        // driver, those inputs run under the driver too: outside it a simulated program's sleeps would never end.
+        const execution = fuzz?.execution
+        const smoke = execution === undefined
+          ? checkProperty(makeArbitrary(arbitraries), values, undefined)
+          : Effect.flatMap(Fuzz.run(makeArbitrary(arbitraries), values, { executions: 100, execution }), (report) => {
+            const failure = Fuzz.formatReport(report)
+            return failure === undefined ? Effect.void : Effect.die(new Error(failure))
+          })
+        return runTest(ctx)(session === undefined ? Effect.andThen(fuzzed, smoke) : fuzzed)
       }
     )
   )
@@ -338,10 +345,16 @@ const makeTester = <R, ExtraContext>(
       name,
       arbitraries,
       (values, ctx) =>
-        Effect.mapEager(
-          mapEffect(Effect.suspend(() => self(values as any, ctx))),
-          (value) => (value as unknown) !== false
-        ),
+        Effect.withFiber((fiber) => {
+          const evaluation = Effect.suspend(() => self(values as any, ctx))
+          // An execution driver such as the simulation owns Clock and Scheduler for the evaluation. The test services
+          // (TestClock among them) are provided around the property, so the driver's two are provided again inside.
+          const owned = options?.fuzz?.execution === undefined ? evaluation : evaluation.pipe(
+            Effect.provideService(Clock.Clock, fiber.getRef(Clock.Clock)),
+            Effect.provideService(Scheduler.Scheduler, fiber.getRef(Scheduler.Scheduler))
+          )
+          return Effect.mapEager(mapEffect(owned), (value) => (value as unknown) !== false)
+        }),
       options
     )
 
