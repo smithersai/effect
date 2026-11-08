@@ -18775,6 +18775,21 @@ export interface JsonObject {
   readonly [x: string]: Json
 }
 /**
+ * The JSON value schema, retaining its required readonly field metadata when
+ * annotated, checked, or rebuilt.
+ *
+ * @stability stable
+ * @category schemas
+ * @since 4.1.2
+ */
+export interface JsonValueSchema extends Codec<Json> {
+  readonly "Rebuild": JsonValueSchema
+  readonly "~type.mutability": "readonly"
+  readonly "~type.optionality": "required"
+  readonly "~encoded.mutability": "readonly"
+  readonly "~encoded.optionality": "required"
+}
+/**
  * Schema that accepts and validates any immutable JSON-compatible value.
  *
  * **Example** (Validating a JSON value)
@@ -18789,7 +18804,7 @@ export interface JsonObject {
  * @category schemas
  * @since 4.0.0
  */
-export const Json: Codec<Json> = make(SchemaAST.annotate(SchemaAST.Json, {
+export const Json: JsonValueSchema = make(SchemaAST.annotate(SchemaAST.Json, {
   toCode: () => ({
     runtime: "Schema.Json",
     Type: "Schema.Json"
