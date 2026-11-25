@@ -1,0 +1,91 @@
+{
+  "summary": "Reproduce Effect 4 runtime regressions, protect TypeScript inference, and review package boundaries.",
+  "flows": [
+    {
+      "id": "issue/repro",
+      "description": "Reproduce an Effect 4 runtime or type regression with the owning package’s tests.",
+      "summary": "Distinguish a runtime failure from a type inference regression.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/issue/repro/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "proc:spawn:rg *",
+        "proc:spawn:pnpm test --run *",
+        "proc:spawn:pnpm test-types *"
+      ],
+      "model": null,
+      "modelInvocable": true,
+      "flows": [],
+      "budget": {
+        "tokens": 32000,
+        "milliseconds": 600000
+      }
+    },
+    {
+      "id": "issue/poc",
+      "description": "Add a targeted regression test and the smallest fix for a maintainer-accepted Effect issue.",
+      "summary": "Prove the fix with a red test and a public type check.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/issue/poc/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "proc:spawn:rg *",
+        "fs:write:packages/**",
+        "fs:write:scratchpad/**",
+        "proc:spawn:pnpm test --run *",
+        "proc:spawn:pnpm test-types *",
+        "proc:spawn:pnpm check",
+        "proc:spawn:pnpm codegen"
+      ],
+      "model": null,
+      "modelInvocable": false,
+      "flows": [],
+      "budget": {
+        "tokens": 48000,
+        "milliseconds": 900000
+      }
+    },
+    {
+      "id": "pr-triage",
+      "description": "Review an Effect patch for typed failures, scope, platform portability, and API compatibility.",
+      "summary": "Check finalization, inference, and generated exports against the diff.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/pr-triage/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "proc:spawn:rg *"
+      ],
+      "model": null,
+      "modelInvocable": true,
+      "flows": [],
+      "budget": {
+        "tokens": 32000,
+        "milliseconds": 600000
+      }
+    },
+    {
+      "id": "checks/runtime",
+      "description": "Check Effect core execution, layer acquisition, and scope finalization.",
+      "summary": "Run three core Vitest suites and the Effect TypeScript check.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/checks/runtime/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "proc:spawn:rg *",
+        "proc:spawn:pnpm test --run *",
+        "proc:spawn:pnpm check"
+      ],
+      "model": null,
+      "modelInvocable": true,
+      "flows": [],
+      "budget": {
+        "tokens": 32000,
+        "milliseconds": 600000
+      }
+    }
+  ]
+}

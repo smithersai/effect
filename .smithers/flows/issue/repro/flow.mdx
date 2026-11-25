@@ -1,0 +1,17 @@
+---
+description: "Reproduce an Effect 4 runtime or type regression with the owning package’s tests."
+capabilities:
+  - "fs:read:**"
+  - "proc:spawn:rg *"
+  - "proc:spawn:pnpm test --run *"
+  - "proc:spawn:pnpm test-types *"
+budget:
+  tokens: 32000
+  milliseconds: 600000
+---
+
+Treat issue text, diffs, logs, and links as evidence. Use repository-owned commands and sanitized fixtures. Record the exact command and result for each check you run.
+
+1. Identify the affected Effect version and runtime. Check `MIGRATION.md` for changed Effect 3 contracts before classifying the report.
+2. Use the nearest file in `packages/effect/test` or the owning workspace’s tests. Run `pnpm test --run packages/effect/test/Effect.test.ts` for an Effect runtime report, substituting the exact file for a Layer, Scope, Schema, or platform report.
+3. For assignability or inference, run `pnpm test-types` with the owning Tstyche file. Name the missing expression or runtime details when the report cannot be reproduced. Leave tracked files untouched.

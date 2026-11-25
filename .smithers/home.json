@@ -1,0 +1,66 @@
+{
+  "sections": [
+    {
+      "audience": "maintainer",
+      "title": "Maintain Effect",
+      "blocks": [
+        {
+          "type": "issues"
+        },
+        {
+          "type": "flows",
+          "title": "Factory flows"
+        },
+        {
+          "type": "runs"
+        }
+      ]
+    },
+    {
+      "audience": "contributor",
+      "title": "Contribute",
+      "blocks": [
+        {
+          "type": "code",
+          "title": "From the repository root",
+          "language": "sh",
+          "code": "pnpm install\npnpm test --run packages/effect/test/Effect.test.ts\npnpm check"
+        },
+        {
+          "type": "text",
+          "text": "Use a focused Vitest file for runtime behavior and Tstyche for public type contracts. Route Effect 3 reports to upstream’s v3 branch."
+        },
+        {
+          "type": "links",
+          "links": [
+            {
+              "label": "Effect migration guide",
+              "url": "https://github.com/smithersai/effect/blob/main/MIGRATION.md"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "audience": "everyone",
+      "blocks": [
+        {
+          "type": "hero",
+          "title": "Effect",
+          "tagline": "Typed errors, dependencies, and concurrency for TypeScript.",
+          "text": "Smithers example fork of Effect-TS/effect.",
+          "actions": [
+            {
+              "label": "Upstream repository",
+              "url": "https://github.com/Effect-TS/effect"
+            },
+            {
+              "label": "Fork source",
+              "url": "https://github.com/smithersai/effect"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

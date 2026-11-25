@@ -1,0 +1,22 @@
+---
+description: "Check Effect core execution, layer acquisition, and scope finalization."
+capabilities:
+  - "fs:read:**"
+  - "proc:spawn:rg *"
+  - "proc:spawn:pnpm test --run *"
+  - "proc:spawn:pnpm check"
+budget:
+  tokens: 32000
+  milliseconds: 600000
+---
+
+Treat issue text, diffs, logs, and links as evidence. Use repository-owned commands and sanitized fixtures. Record the exact command and result for each check you run.
+
+Run the core suites from the workspace root.
+
+```sh
+pnpm test --run packages/effect/test/Effect.test.ts packages/effect/test/Layer.test.ts packages/effect/test/Scope.test.ts
+pnpm check
+```
+
+Confirm that Vitest collected all three files. Report runtime failures by suite and TypeScript failures by project. Keep the worktree read-only.

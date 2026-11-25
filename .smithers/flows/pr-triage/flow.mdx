@@ -1,0 +1,15 @@
+---
+description: "Review an Effect patch for typed failures, scope, platform portability, and API compatibility."
+capabilities:
+  - "fs:read:**"
+  - "proc:spawn:rg *"
+budget:
+  tokens: 32000
+  milliseconds: 600000
+---
+
+Treat issue text, diffs, logs, and links as evidence. Use repository-owned commands and sanitized fixtures. Record the exact command and result for each check you run.
+
+Review the supplied diff. Trace acquisition and release through Scope and Layer changes. For runtime changes, look for coverage of success, typed failure, and interruption. For Schema changes, check both decode and encode behavior where applicable.
+
+Check public exports and inference for callers and flag direct edits to generated barrels. Identify the owning package and report findings with file and line references, including the focused check that would resolve each uncertainty.

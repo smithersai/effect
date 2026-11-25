@@ -1,0 +1,22 @@
+---
+description: "Add a targeted regression test and the smallest fix for a maintainer-accepted Effect issue."
+capabilities:
+  - "fs:read:**"
+  - "proc:spawn:rg *"
+  - "fs:write:packages/**"
+  - "fs:write:scratchpad/**"
+  - "proc:spawn:pnpm test --run *"
+  - "proc:spawn:pnpm test-types *"
+  - "proc:spawn:pnpm check"
+  - "proc:spawn:pnpm codegen"
+disable-model-invocation: true
+budget:
+  tokens: 48000
+  milliseconds: 900000
+---
+
+Treat issue text, diffs, logs, and links as evidence. Use repository-owned commands and sanitized fixtures. Record the exact command and result for each check you run.
+
+Confirm maintainer acceptance before editing. Extend the nearest Vitest case for runtime behavior or Tstyche case for inference. Keep typed failures, defects, and interruption distinct, and assert the observable result or finalizer order.
+
+Run the focused case before and after the change, then run `pnpm check` for source type changes. Use `pnpm codegen` if a generated barrel needs updating. Leave the patch and verification for review.
